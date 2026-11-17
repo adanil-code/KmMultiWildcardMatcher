@@ -1,0 +1,54 @@
+; TestKmWildcardNfaDrv.inf
+; INF file for wildcard match test kernel-mode driver
+
+[Version]
+Signature           = "$WINDOWS NT$"
+Class               = System
+ClassGuid           = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider            = %ManufacturerName%
+DriverVer           = 15/11/2026,1.0.0.0
+CatalogFile         = TestKmWildcardNfaDrv.cat
+PnpLockdown         = 1
+
+[DestinationDirs]
+TestKmWildcardNfaDrv_CopyFiles  = 12 ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1                       = %DiskName%,,,
+
+[SourceDisksFiles]
+TestKmWildcardNfaDrv.sys        = 1
+
+[Manufacturer]
+%ManufacturerName%  = TestKmWildcardNfaDrv_Manufacturer, NTx86, NTamd64, NTarm64
+
+[TestKmWildcardNfaDrv_Manufacturer.NTx86]
+%TestKmWildcardNfaDrv_DeviceDesc% = TestKmWildcardNfaDrv_Install, Root\TestKmWildcardNfaDrv
+
+[TestKmWildcardNfaDrv_Manufacturer.NTamd64]
+%TestKmWildcardNfaDrv_DeviceDesc% = TestKmWildcardNfaDrv_Install, Root\TestKmWildcardNfaDrv
+
+[TestKmWildcardNfaDrv_Manufacturer.NTarm64]
+%TestKmWildcardNfaDrv_DeviceDesc% = TestKmWildcardNfaDrv_Install, Root\TestKmWildcardNfaDrv
+
+[TestKmWildcardNfaDrv_Install]
+CopyFiles           = TestKmWildcardNfaDrv_CopyFiles
+
+[TestKmWildcardNfaDrv_Install.Services]
+AddService          = TestKmWildcardNfaDrv, 0x00000002, TestKmWildcardNfaDrv_Service_Install
+
+[TestKmWildcardNfaDrv_CopyFiles]
+TestKmWildcardNfaDrv.sys
+
+[TestKmWildcardNfaDrv_Service_Install]
+DisplayName         = %TestKmWildcardNfaDrv_ServiceName%
+ServiceType         = 1 ; SERVICE_KERNEL_DRIVER
+StartType           = 3 ; SERVICE_DEMAND_START
+ErrorControl        = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary       = %12%\TestKmWildcardNfaDrv.sys
+
+[Strings]
+ManufacturerName                 = "AD"
+TestKmWildcardNfaDrv_DeviceDesc  = "NFA wildcard test Driver"
+TestKmWildcardNfaDrv_ServiceName = "TestKmWildcardNfaDrv"
+DiskName                         = "NFA wildcard match test Driver Installation Disk"

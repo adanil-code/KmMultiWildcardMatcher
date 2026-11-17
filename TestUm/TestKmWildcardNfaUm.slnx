@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="TestKmWildcardNfaUm.vcxproj" Id="a19d8a20-5b24-4f1c-ae93-653d4064b3ad" />
+</Solution>

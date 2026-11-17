@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="TestKmWildcardNfaDrv.vcxproj" Id="ccbb72e1-9df7-7ad0-4f90-05cc0b1bd67c">
+    <Deploy />
+  </Project>
+</Solution>
