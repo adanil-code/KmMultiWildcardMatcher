@@ -18,7 +18,11 @@
 #include <ntifs.h>
 #include <ntddk.h>
 #include <ntstrsafe.h>
+
+#pragma warning(push)
+#pragma warning(disable : 4392) // Workaround until Microsoft ships an updated WDK ammintrin.h header.
 #include <intrin.h>
+#pragma warning(pop)
 
 #include "KmWildcardNfa.h"
 

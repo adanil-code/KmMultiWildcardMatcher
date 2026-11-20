@@ -15,7 +15,11 @@
 #pragma once
 
 #include <ntddk.h>
+
+#pragma warning(push)
+#pragma warning(disable : 4392) // Workaround until Microsoft ships an updated WDK ammintrin.h header.
 #include <intrin.h>
+#pragma warning(pop)
 
 #define NFA_POOL_TAG 'WcMp'
 
