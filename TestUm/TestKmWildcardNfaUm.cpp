@@ -16,8 +16,6 @@
 // User Mode Test Suite App for Wildcard Matching Engine
 // -------------------------------------------------------------------------------------
 #include "ntddk.h"
-#include <stdint.h>
-#include <intrin.h>
 
 // -------------------------------------------------------------------------------------
 // Logging Setup
