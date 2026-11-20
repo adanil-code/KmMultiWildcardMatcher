@@ -16,11 +16,6 @@
 
 #include <ntddk.h>
 
-#pragma warning(push)
-#pragma warning(disable : 4392) // Workaround until Microsoft ships an updated WDK ammintrin.h header.
-#include <intrin.h>
-#pragma warning(pop)
-
 #define NFA_POOL_TAG 'WcMp'
 
 // -------------------------------------------------------------------------------------
@@ -55,7 +50,7 @@
 //        root '*' steady state and dynamically whenever Word 0 is self-sustained by
 //        WILD_CARD_SCOPE::SCOPE_DEFAULT Op::Star states (m_ullWord0DefaultStarMask).
 //      - Early-Exit on Permanent Accepting States (m_ullWord0PermanentAcceptMask):
-//        Precomputes terminal WILD_CARD_SCOPE::SCOPE_DEFAULT Op::Star accepting states 
+//        Precomputes terminal WILD_CARD_SCOPE::SCOPE_DEFAULT Op::Star accepting states
 //        so MatchFirst returns TRUE immediately upon activating an un-killable wildcard
 //        state.
 //      - 4-Wide / 8-Wide Unbranched Literal-Run & Root Prefix Verification: Compares
@@ -78,8 +73,9 @@
 //   - MatchFirst() and MatchAll() support IRQL <= DISPATCH_LEVEL for 8-bit CHAR, exact
 //     16-bit WCHAR, and pure-ASCII 16-bit WCHAR inputs. Case-insensitive 16-bit WCHAR
 //     matching on non-ASCII code points (>= 0x80) requires IRQL < DISPATCH_LEVEL to
-//     access paged NLS uppercase tables (gracefully degrades to exact comparison if
-//     invoked at >= DISPATCH_LEVEL in release builds).
+//     access paged NLS uppercase tables (if invoked at >= DISPATCH_LEVEL in release
+//     builds, non-ASCII input code points are not case-folded and are compared directly
+//     against the pre-upcased pattern characters).
 //
 // Template Parameters:
 //   TContext - Caller-supplied context type associated with each pattern.
@@ -93,6 +89,9 @@ class KmWildcardNfa
 
     static_assert(__is_trivially_copyable(TContext),
                   "KmWildcardNfa requires TContext to be trivially copyable.");
+
+    static_assert(alignof(TContext) <= MEMORY_ALLOCATION_ALIGNMENT,
+                  "KmWildcardNfa requires TContext alignment <= MEMORY_ALLOCATION_ALIGNMENT.");
 
 public:
 
@@ -119,10 +118,11 @@ private:
     };
 
     // Architectural capacity and stack fast-path constants
-    static constexpr ULONG STACK_FAST_PATH_WORDS = 63;                       // Max 64-bit state words (4,032 states) handled on the kernel stack in Path A
-    static constexpr ULONG MAX_SUPERMASK_WORDS   = 64;                       // Max 2nd-level mask words tracked by the 64-bit ulSuperMask register
-    static constexpr ULONG MAX_STATE_WORDS       = MAX_SUPERMASK_WORDS * 64; // Max 64-bit state words (4,096 words) supported by the 3-level hierarchy
-    static constexpr ULONG MAX_INSTRUCTIONS      = MAX_STATE_WORDS * 64;     // Max total NFA states/instructions (262,144 states) supported by the engine
+    static constexpr ULONG STACK_SMALL_FAST_PATH_WORDS = 16;                       // Small stack fast-path tier (1,024 states, 256-byte buffers) minimizing kernel stack use
+    static constexpr ULONG STACK_FAST_PATH_WORDS       = 63;                       // Max 64-bit state words (4,032 states) handled on the kernel stack in Path A
+    static constexpr ULONG MAX_SUPERMASK_WORDS         = 64;                       // Max 2nd-level mask words tracked by the 64-bit ulSuperMask register
+    static constexpr ULONG MAX_STATE_WORDS             = MAX_SUPERMASK_WORDS * 64; // Max 64-bit state words (4,096 words) supported by the 3-level hierarchy
+    static constexpr ULONG MAX_INSTRUCTIONS            = MAX_STATE_WORDS * 64;     // Max total NFA states/instructions (262,144 states) supported by the engine
 
     // High-bit flag stored in NFA_INSTRUCTION::ulExtraOffset when a state starts an
     // unbranched Op::Literal run >= CHARS_PER_QUAD. Safe without masking in the common
@@ -239,6 +239,15 @@ private:
         ULONG64 ullNonAsciiLiteralMask;   // Op::Literal states with chLiteral >= 0x80
     };
 
+    // Padding separating m_lScratchBufferInUse from Cache Line 1 by at least one full
+    // SYSTEM_CACHE_ALIGNMENT_SIZE (64 B on x64, 128 B on ARM64) without raising class
+    // alignof() above 16-byte ExAllocatePool2 alignment guarantees.
+    static_assert(SYSTEM_CACHE_ALIGNMENT_SIZE > (sizeof(PATTERN_ENTRY*) + (sizeof(ULONG) * 2)),
+                  "Unexpected SYSTEM_CACHE_ALIGNMENT_SIZE.");
+
+    static constexpr SIZE_T SCRATCH_LATCH_PAD_BYTES =
+        SYSTEM_CACHE_ALIGNMENT_SIZE - (sizeof(PATTERN_ENTRY*) + (sizeof(ULONG) * 2));
+
 private:
 
     // Cache Line 0 (Bytes 0..63): Hot read-only VM execution scalars & core table pointers
@@ -264,10 +273,11 @@ private:
     ULONG64               m_ullWord0PermanentAcceptMask; // Bitmask of un-killable Word-0 SCOPE_DEFAULT Op::Star accepting states for MatchFirst early-exit
     mutable ULONG64*      m_pulScratchStateBuffer;       // Pre-zeroed non-paged scratch buffer used by Path B (> 63 state words) when uncontended
 
-    // Cache Line 2 (Bytes 128..151): Cold pattern-staging metadata & tail-isolated atomic latch
+    // Cache Line 2+: Cold pattern-staging metadata & cache-line-isolated atomic latch
     PATTERN_ENTRY*        m_pPatterns;                   // Dynamically resized non-paged array of staged pattern entries
     ULONG                 m_ulPatternCount;              // Current number of patterns registered via AddPattern()
     ULONG                 m_ulPatternCapacity;           // Allocated capacity (in entries) of m_pPatterns
+    UCHAR                 m_ScratchLatchPad[SCRATCH_LATCH_PAD_BYTES]; // Guarantees m_lScratchBufferInUse never shares a cache line with Cache Line 1
     mutable volatile LONG m_lScratchBufferInUse;         // Atomic latch (0 = free, 1 = acquired) guarding m_pulScratchStateBuffer in Path B
 
 private:
@@ -414,7 +424,7 @@ private:
     static __declspec(noinline) ULONG64 SwarUpcaseQuadFallback(_In_ ULONG64 ullQuad) noexcept
     {
         ULONG64 ullFolded = 0;
-        
+
         if constexpr (sizeof(TChar) == 1)
         {
             // Extract, upcase, and repack each of the 8 byte lanes individually
@@ -435,7 +445,7 @@ private:
             ullFolded |= (CharToUint64(UpcaseChar(static_cast<TChar>((ullQuad >> 32) & 0xFFFF))) << 32);
             ullFolded |= (CharToUint64(UpcaseChar(static_cast<TChar>((ullQuad >> 48) & 0xFFFF))) << 48);
         }
-        
+
         return ullFolded;
     }
 
@@ -750,7 +760,7 @@ private:
                     ullQuad = SwarUpcaseQuadFallback(ullQuad);
                 }
             }
-            
+
             if constexpr (sizeof(TChar) == 1)
             {
                 // Test each of the 8 byte lanes against ullExitStateMask via O(1) SWAR filter
@@ -906,10 +916,14 @@ private:
     // Recursively computes the epsilon-closure of a Trie node's outgoing transitions.
     // Whenever a child state is Op::Star, it can match zero characters, so its own
     // children are immediately added to the target bitvector as well.
+    // When pulTouchedWords and pulTouchedCount are provided, records each newly
+    // non-zero state word index once for O(touched) sparse scanning and cleanup.
     // ---------------------------------------------------------------------------------
-    static VOID ComputeChildrenEpsilonClosure(_In_    const TRIE_NODE* __restrict pTrieNodes,
-                                              _In_    ULONG                       ulParentNodeIdx,
-                                              _Inout_ ULONG64* __restrict         pulTargetBits) noexcept
+    static VOID ComputeChildrenEpsilonClosure(_In_        const TRIE_NODE* __restrict pTrieNodes,
+                                              _In_        ULONG                       ulParentNodeIdx,
+                                              _Inout_     ULONG64* __restrict         pulTargetBits,
+                                              _Out_opt_   ULONG* __restrict           pulTouchedWords = NULL,
+                                              _Inout_opt_ ULONG* __restrict           pulTouchedCount = NULL) noexcept
     {
         ULONG ulChildIdx = pTrieNodes[ulParentNodeIdx].ulFirstChild;
 
@@ -923,6 +937,11 @@ private:
             // Guard against cycles and redundant traversal if already visited
             if ((pulTargetBits[ulWordIdx] & ullBitMask) == 0)
             {
+                if (pulTouchedWords != NULL && pulTouchedCount != NULL && pulTargetBits[ulWordIdx] == 0)
+                {
+                    pulTouchedWords[(*pulTouchedCount)++] = ulWordIdx;
+                }
+
                 pulTargetBits[ulWordIdx] |= ullBitMask;
 
                 // Op::Star matches zero or more characters, so propagate epsilon transition to its children
@@ -930,7 +949,9 @@ private:
                 {
                     ComputeChildrenEpsilonClosure(pTrieNodes,
                                                   ulChildIdx,
-                                                  pulTargetBits);
+                                                  pulTargetBits,
+                                                  pulTouchedWords,
+                                                  pulTouchedCount);
                 }
             }
 
@@ -941,26 +962,34 @@ private:
     // ---------------------------------------------------------------------------------
     // Computes the full outgoing transition bitvector for a single Trie node, including
     // its self-loop bit when the node is Op::Star, plus its children's epsilon-closure.
+    // Expects pulTargetBits to be pre-zeroed and records all touched word indices in
+    // pulTouchedWords[0..*pulTouchedCount-1] for O(touched) sparse scanning and cleanup.
     // ---------------------------------------------------------------------------------
-    VOID ComputeNodeTransitionClosure(_In_                           const TRIE_NODE* __restrict pTrieNodes,
-                                      _In_                           ULONG                       ulNodeIdx,
-                                      _Out_writes_(m_ulStateWords64) ULONG64* __restrict         pulTargetBits) const noexcept
+    VOID ComputeNodeTransitionClosure(_In_                              const TRIE_NODE* __restrict pTrieNodes,
+                                      _In_                              ULONG                       ulNodeIdx,
+                                      _Inout_updates_(m_ulStateWords64) ULONG64* __restrict         pulTargetBits,
+                                      _Out_writes_(m_ulStateWords64)    ULONG* __restrict           pulTouchedWords,
+                                      _Out_                             ULONG* __restrict           pulTouchedCount) const noexcept
     {
-        RtlZeroMemory(
-            pulTargetBits,
-            static_cast<SIZE_T>(m_ulStateWords64) * sizeof(ULONG64)
-        );
+        ULONG ulTouchedCount = 0;
 
         // Op::Star states re-activate themselves upon consuming a valid character
         if (pTrieNodes[ulNodeIdx].eOp == Op::Star)
         {
             ULONG ulSelfState = pTrieNodes[ulNodeIdx].ulStateIdx;
-            pulTargetBits[ulSelfState >> 6] |= (1ULL << (ulSelfState & 63));
+            ULONG ulSelfWord  = ulSelfState >> 6;
+
+            pulTouchedWords[ulTouchedCount++] = ulSelfWord;
+            pulTargetBits[ulSelfWord]        |= (1ULL << (ulSelfState & 63));
         }
 
         ComputeChildrenEpsilonClosure(pTrieNodes,
                                       ulNodeIdx,
-                                      pulTargetBits);
+                                      pulTargetBits,
+                                      pulTouchedWords,
+                                      &ulTouchedCount);
+
+        *pulTouchedCount = ulTouchedCount;
     }
 
     // ---------------------------------------------------------------------------------
@@ -1024,6 +1053,36 @@ private:
 
         *pulEndNodeIdx = ulCurRunNode;
         return ulRunLen;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Detects a shared anchored root Op::Literal chain of length >= CHARS_PER_QUAD.
+    // Returns the prefix length (0 if none qualifies) and sets *pulLastPrefNode to the
+    // final Trie node of the prefix (or 0 if no qualifying prefix exists).
+    // ---------------------------------------------------------------------------------
+    static __forceinline ULONG FindSharedRootLiteralPrefix(_In_  const TRIE_NODE* __restrict pTrieNodes,
+                                                           _Out_ ULONG* __restrict           pulLastPrefNode) noexcept
+    {
+        *pulLastPrefNode = 0;
+
+        ULONG ulRootChild = pTrieNodes[0].ulFirstChild;
+        if (pTrieNodes[0].ulFirstMatchIdx == MAXULONG &&
+            ulRootChild != MAXULONG &&
+            pTrieNodes[ulRootChild].ulNextSibling == MAXULONG &&
+            pTrieNodes[ulRootChild].eOp == Op::Literal)
+        {
+            ULONG ulLastNode  = 0;
+            ULONG ulPrefixLen = WalkUnbranchedLiteralChain(pTrieNodes,
+                                                           ulRootChild,
+                                                           &ulLastNode);
+            if (ulPrefixLen >= CHARS_PER_QUAD)
+            {
+                *pulLastPrefNode = ulLastNode;
+                return ulPrefixLen;
+            }
+        }
+
+        return 0;
     }
 
     // ---------------------------------------------------------------------------------
@@ -1115,7 +1174,7 @@ private:
         // We no longer block compilation if cbMaxTrieNodes exceeds MAX_INSTRUCTIONS here, 
         // because Trie prefix-merging will collapse thousands of identical paths down to 
         // a footprint that safely fits inside the engine limits.
-        TRIE_NODE* __restrict pTrieNodes = static_cast<TRIE_NODE*>(ExAllocatePool2(POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED, 
+        TRIE_NODE* __restrict pTrieNodes = static_cast<TRIE_NODE*>(ExAllocatePool2(POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED,
                                                                                    cbMaxTrieNodes * sizeof(TRIE_NODE),
                                                                                    NFA_POOL_TAG));
 
@@ -1163,7 +1222,7 @@ private:
                 if (ch == kEscape && c + 1 < rEntry.ulLength)
                 {
                     TChar chNext = rEntry.pszPattern[c + 1];
-                    
+
                     if (chNext == kStar || chNext == kQuestion || chNext == kEscape)
                     {
                         c++;
@@ -1290,10 +1349,15 @@ private:
     // ---------------------------------------------------------------------------------
     // Assigns state indices using Chain-Contiguous Sibling BFS so sibling branches
     // remain contiguous while single-child chains pack into the same 64-bit state word.
+    // When a shared root literal prefix (>= CHARS_PER_QUAD) is present, starts BFS from
+    // ulLastPrefNode so live post-prefix states occupy Word 0 (preserving Word-0 SWAR
+    // optimizations), assigning the skipped root prefix nodes at the tail as fallback.
     // ---------------------------------------------------------------------------------
     _IRQL_requires_max_(APC_LEVEL)
     static NTSTATUS AssignStateIndicesBfs(_Inout_updates_(ulTrieNodeCount) TRIE_NODE* __restrict pTrieNodes,
-                                          _In_                             ULONG                 ulTrieNodeCount) noexcept
+                                          _In_                             ULONG                 ulTrieNodeCount,
+                                          _In_                             ULONG                 ulRootPrefixLen,
+                                          _In_                             ULONG                 ulLastPrefNode) noexcept
     {
         // Step 2: Assign state indices using Chain-Contiguous Sibling BFS so sibling
         // branches remain contiguous while single-child chains pack into the same word.
@@ -1310,8 +1374,10 @@ private:
         ULONG ulQueueTail = 0;
         ULONG ulNextState = 0;
 
-        // Seed the BFS queue with virtual root node 0 (which does not consume a state index)
-        pulBfsQueue[ulQueueTail++] = 0;
+        // Seed the BFS queue with ulLastPrefNode (when skipping a shared root prefix) or
+        // virtual root node 0 so active post-prefix states start at state 0 (Word 0).
+        ULONG ulBfsRoot            = (ulRootPrefixLen >= CHARS_PER_QUAD) ? ulLastPrefNode : 0;
+        pulBfsQueue[ulQueueTail++] = ulBfsRoot;
 
         while (ulQueueHead < ulQueueTail)
         {
@@ -1336,6 +1402,18 @@ private:
             }
         }
 
+        // Assign skipped root prefix nodes at the tail so they remain valid if
+        // m_pszLiteralRuns allocation fails and the VM falls back to root execution.
+        if (ulRootPrefixLen >= CHARS_PER_QUAD)
+        {
+            ULONG ulWalk = 0;
+            for (ULONG idx = 0; idx < ulRootPrefixLen; idx++)
+            {
+                ulWalk                        = pTrieNodes[ulWalk].ulFirstChild;
+                pTrieNodes[ulWalk].ulStateIdx = ulNextState++;
+            }
+        }
+
         ExFreePoolWithTag(pulBfsQueue, NFA_POOL_TAG);
         return STATUS_SUCCESS;
     }
@@ -1347,9 +1425,11 @@ private:
     _IRQL_requires_max_(APC_LEVEL)
     NTSTATUS AllocateRuntimeTables(_In_reads_(ulTrieNodeCount) const TRIE_NODE* __restrict pTrieNodes,
                                    _In_                        ULONG                       ulTrieNodeCount,
-                                   _Outptr_                    ULONG64** __restrict        ppulScratchTargetBits) noexcept
+                                   _Outptr_                    ULONG64** __restrict        ppulScratchTargetBits,
+                                   _Outptr_                    ULONG** __restrict          ppulTouchedWords) noexcept
     {
         *ppulScratchTargetBits = NULL;
+        *ppulTouchedWords      = NULL;
 
         // Step 3: Allocate runtime NFA instruction, cold state metadata, and SWAR filter tables
         ULONG  ulInstructionCount  = ulTrieNodeCount - 1;
@@ -1375,16 +1455,27 @@ private:
                                                                    cbBitvectorWords * sizeof(ULONG64),
                                                                    NFA_POOL_TAG));
 
-        ULONG64* __restrict pulScratchTargetBits = static_cast<ULONG64*>(ExAllocatePool2(POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED, // PAGED for temporary bitvector allocation
+        // Zero-initialized once and maintained pre-zeroed via O(touched) sparse cleanup
+        ULONG64* __restrict pulScratchTargetBits = static_cast<ULONG64*>(ExAllocatePool2(POOL_FLAG_PAGED, // PAGED for temporary bitvector allocation
                                                                                          static_cast<SIZE_T>(m_ulStateWords64) * sizeof(ULONG64),
                                                                                          NFA_POOL_TAG));
+
+        ULONG* __restrict pulTouchedWords = static_cast<ULONG*>(ExAllocatePool2(POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED, // PAGED for temporary touched-word index list
+                                                                                static_cast<SIZE_T>(m_ulStateWords64) * sizeof(ULONG),
+                                                                                NFA_POOL_TAG));
 
         if (m_pInstructions == NULL ||
             m_pStateMetadata == NULL ||
             m_pWordFilters == NULL ||
             m_pulInitialStates == NULL ||
-            pulScratchTargetBits == NULL)
+            pulScratchTargetBits == NULL ||
+            pulTouchedWords == NULL)
         {
+            if (pulTouchedWords != NULL)
+            {
+                ExFreePoolWithTag(pulTouchedWords, NFA_POOL_TAG);
+            }
+
             if (pulScratchTargetBits != NULL)
             {
                 ExFreePoolWithTag(pulScratchTargetBits, NFA_POOL_TAG);
@@ -1403,6 +1494,7 @@ private:
                                                                             NFA_POOL_TAG));
             if (m_pulScratchStateBuffer == NULL)
             {
+                ExFreePoolWithTag(pulTouchedWords, NFA_POOL_TAG);
                 ExFreePoolWithTag(pulScratchTargetBits, NFA_POOL_TAG);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
@@ -1413,21 +1505,23 @@ private:
 
         for (ULONG ulNodeIdx = 1; ulNodeIdx < ulTrieNodeCount; ulNodeIdx++)
         {
-            ComputeNodeTransitionClosure(pTrieNodes, ulNodeIdx, pulScratchTargetBits);
-
             ULONG ulWordsUsed = 0;
-            for (ULONG w = 0; w < m_ulStateWords64; w++)
-            {
-                if (pulScratchTargetBits[w] != 0)
-                {
-                    ulWordsUsed++;
-                }
-            }
+            ComputeNodeTransitionClosure(pTrieNodes,
+                                         ulNodeIdx,
+                                         pulScratchTargetBits,
+                                         pulTouchedWords,
+                                         &ulWordsUsed);
 
             // First non-zero target word fits inline in NFA_INSTRUCTION; remaining words spill into m_pExtraTargets
             if (ulWordsUsed > 1)
             {
                 ulTotalExtraWords += (ulWordsUsed - 1);
+            }
+
+            // Sparse-zero only touched words so pulScratchTargetBits remains pre-zeroed in O(touched)
+            for (ULONG t = 0; t < ulWordsUsed; t++)
+            {
+                pulScratchTargetBits[pulTouchedWords[t]] = 0;
             }
         }
 
@@ -1438,12 +1532,14 @@ private:
                                                                               NFA_POOL_TAG));
             if (m_pExtraTargets == NULL)
             {
+                ExFreePoolWithTag(pulTouchedWords, NFA_POOL_TAG);
                 ExFreePoolWithTag(pulScratchTargetBits, NFA_POOL_TAG);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
         }
 
         *ppulScratchTargetBits = pulScratchTargetBits;
+        *ppulTouchedWords      = pulTouchedWords;
         return STATUS_SUCCESS;
     }
 
@@ -1453,15 +1549,16 @@ private:
     // ---------------------------------------------------------------------------------
     VOID PopulateInstructionsAndFilters(_In_reads_(ulTrieNodeCount)       const TRIE_NODE* __restrict pTrieNodes,
                                         _In_                              ULONG                       ulTrieNodeCount,
-                                        _Inout_updates_(m_ulStateWords64) ULONG64* __restrict         pulScratchTargetBits) noexcept
+                                        _Inout_updates_(m_ulStateWords64) ULONG64* __restrict         pulScratchTargetBits,
+                                        _Out_writes_(m_ulStateWords64)    ULONG* __restrict           pulTouchedWords) noexcept
     {
         // Populate hot 16-byte instructions, cold state metadata, and per-word SWAR filter masks
-        ULONG                         ulExtraCursor   = 0;
-        ULONG64* __restrict           pulAcceptStates = GetAcceptStates();
-        NFA_INSTRUCTION* __restrict   pInstructions   = m_pInstructions;
-        NFA_STATE_METADATA* __restrict pStateMetadata = m_pStateMetadata;
-        WORD_SWAR_FILTER* __restrict  pWordFilters    = m_pWordFilters;
-        EXTRA_TARGET_WORD* __restrict pExtraTargets   = m_pExtraTargets;
+        ULONG                          ulExtraCursor   = 0;
+        ULONG64* __restrict            pulAcceptStates = GetAcceptStates();
+        NFA_INSTRUCTION* __restrict    pInstructions   = m_pInstructions;
+        NFA_STATE_METADATA* __restrict pStateMetadata  = m_pStateMetadata;
+        WORD_SWAR_FILTER* __restrict   pWordFilters    = m_pWordFilters;
+        EXTRA_TARGET_WORD* __restrict  pExtraTargets   = m_pExtraTargets;
 
         for (ULONG ulNodeIdx = 1; ulNodeIdx < ulTrieNodeCount; ulNodeIdx++)
         {
@@ -1498,29 +1595,31 @@ private:
                 }
             }
 
-            ComputeNodeTransitionClosure(pTrieNodes, ulNodeIdx, pulScratchTargetBits);
-
-            BOOLEAN bPrimarySet = FALSE;
+            ULONG ulWordsUsed = 0;
+            ComputeNodeTransitionClosure(pTrieNodes,
+                                         ulNodeIdx,
+                                         pulScratchTargetBits,
+                                         pulTouchedWords,
+                                         &ulWordsUsed);
 
             // Store the first non-zero target state word inline in rInst and spill any additional words to m_pExtraTargets
-            for (ULONG w = 0; w < m_ulStateWords64; w++)
+            for (ULONG t = 0; t < ulWordsUsed; t++)
             {
-                ULONG64 ullBits = pulScratchTargetBits[w];
-                if (ullBits != 0)
+                ULONG   w               = pulTouchedWords[t];
+                ULONG64 ullBits         = pulScratchTargetBits[w];
+                pulScratchTargetBits[w] = 0;
+
+                if (t == 0)
                 {
-                    if (!bPrimarySet)
-                    {
-                        rInst.usTargetWord  = static_cast<USHORT>(w);
-                        rInst.ullTargetBits = ullBits;
-                        bPrimarySet         = TRUE;
-                    }
-                    else
-                    {
-                        EXTRA_TARGET_WORD& rExtra = pExtraTargets[ulExtraCursor++];
-                        rExtra.ullTargetBits      = ullBits;
-                        rExtra.ulTargetWord       = w;
-                        rInst.usExtraCount++;
-                    }
+                    rInst.usTargetWord  = static_cast<USHORT>(w);
+                    rInst.ullTargetBits = ullBits;
+                }
+                else
+                {
+                    EXTRA_TARGET_WORD& rExtra = pExtraTargets[ulExtraCursor++];
+                    rExtra.ullTargetBits      = ullBits;
+                    rExtra.ulTargetWord       = w;
+                    rInst.usExtraCount++;
                 }
             }
 
@@ -1589,12 +1688,14 @@ private:
 
     // ---------------------------------------------------------------------------------
     // Configures SWAR Optimization 2 (Steady-State '*' 64-Bit Fast-Forward) when the
-    // virtual root has a single default-scope '*' child with 1 or 2 literal exits.
+    // starting anchor node (virtual root 0 or end of a shared root prefix) has a single
+    // default-scope '*' child with 1 or 2 literal exits.
     // ---------------------------------------------------------------------------------
-    VOID ConfigureStarSteadyStateSkip(_In_ const TRIE_NODE* __restrict pTrieNodes) noexcept
+    VOID ConfigureStarSteadyStateSkip(_In_ const TRIE_NODE* __restrict pTrieNodes,
+                                      _In_ ULONG                       ulAnchorNode) noexcept
     {
-        // Step 4: Configure SWAR Optimization 2 (Steady-State '*' 64-Bit Fast-Forward)
-        ULONG ulRootChild = pTrieNodes[0].ulFirstChild;
+        // Configure SWAR Optimization 2 (Steady-State '*' 64-Bit Fast-Forward)
+        ULONG ulRootChild = pTrieNodes[ulAnchorNode].ulFirstChild;
         if (ulRootChild != MAXULONG &&
             pTrieNodes[ulRootChild].ulNextSibling == MAXULONG &&
             pTrieNodes[ulRootChild].eOp == Op::Star &&
@@ -1649,7 +1750,9 @@ private:
     // updating initial states in-place to the post-prefix closure.
     // ---------------------------------------------------------------------------------
     VOID ConfigureRootLiteralPrefix(_In_reads_(ulTrieNodeCount) const TRIE_NODE* __restrict pTrieNodes,
-                                    _In_                        ULONG                       ulTrieNodeCount) noexcept
+                                    _In_                        ULONG                       ulTrieNodeCount,
+                                    _In_                        ULONG                       ulPrefixLen,
+                                    _In_                        ULONG                       ulLastPrefNode) noexcept
     {
         ULONG ulInstructionCount = ulTrieNodeCount - 1;
         TChar* __restrict pszLiteralRuns = static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_UNINITIALIZED,
@@ -1661,23 +1764,9 @@ private:
             return;
         }
 
-        // Step 5: Configure SWAR Optimization 3 (Shared Root Literal Prefix Fast-Forward).
+        // Configure SWAR Optimization 3 (Shared Root Literal Prefix Fast-Forward).
         // Evaluated before building mid-Trie literal runs so that root prefix states
         // stored at the front of m_pszLiteralRuns are marked visited and not duplicated.
-        ULONG ulRootChild    = pTrieNodes[0].ulFirstChild;
-        ULONG ulPrefixLen    = 0;
-        ULONG ulLastPrefNode = 0;
-
-        if (pTrieNodes[0].ulFirstMatchIdx == MAXULONG &&
-            ulRootChild != MAXULONG &&
-            pTrieNodes[ulRootChild].ulNextSibling == MAXULONG &&
-            pTrieNodes[ulRootChild].eOp == Op::Literal)
-        {
-            ulPrefixLen = WalkUnbranchedLiteralChain(pTrieNodes,
-                                                     ulRootChild,
-                                                     &ulLastPrefNode);
-        }
-
         if (ulPrefixLen >= CHARS_PER_QUAD)
         {
             NFA_STATE_METADATA* __restrict pStateMetadata = m_pStateMetadata;
@@ -1685,7 +1774,7 @@ private:
 
             for (ULONG idx = 0; idx < ulPrefixLen; idx++)
             {
-                ulWalk = pTrieNodes[ulWalk].ulFirstChild;
+                ulWalk              = pTrieNodes[ulWalk].ulFirstChild;
                 pszLiteralRuns[idx] = pTrieNodes[ulWalk].chLiteral;
 
                 // Mark root prefix state as processed (length 1) so the mid-Trie
@@ -1828,11 +1917,11 @@ private:
     // or 8 CHARs) at a time before entering the NFA state machine.
     // ---------------------------------------------------------------------------------
     template <BOOLEAN bCaseInsensitive>
-    __forceinline BOOLEAN VerifyRootLiteralPrefixSwar(_In_reads_(cchLen) const TChar* __restrict pszText,
-                                                      _In_               size_t                  cchLen) const noexcept
+    __forceinline BOOLEAN VerifyRootLiteralPrefixSwar(_In_reads_opt_(cchLen) const TChar* __restrict pszText,
+                                                      _In_                   size_t                  cchLen) const noexcept
     {
         // Input shorter than the mandatory shared root prefix cannot match any pattern
-        if (cchLen < m_ulPrefixLength)
+        if (pszText == NULL || cchLen < m_ulPrefixLength)
         {
             return FALSE;
         }
@@ -1882,11 +1971,12 @@ private:
     //  -1 : Run failed to match or reached a dead-end state (abort VM with FALSE).
     // ---------------------------------------------------------------------------------
     template <BOOLEAN bCaseInsensitive>
+    _Success_(return > 0)
     __forceinline INT TryAdvanceLiteralRunSwar(_In_               ULONG                              ulSingleStateIdx,
                                                _In_reads_(cchLen) const TChar* __restrict            pszText,
                                                _In_               size_t                             cchLen,
                                                _Inout_            size_t* __restrict                 pcchOffset,
-                                               _Out_              const NFA_INSTRUCTION** __restrict ppEndInst) const noexcept
+                                               _Outptr_           const NFA_INSTRUCTION** __restrict ppEndInst) const noexcept
     {
         // Fast check on the hot instruction word before touching cold state metadata
         const NFA_INSTRUCTION* __restrict pInstructions = m_pInstructions;
@@ -1934,7 +2024,7 @@ private:
                                                     _Inout_                           ULONG64& __restrict               rulWordsMask) const noexcept
     {
         // Apply primary inline target word and set its corresponding bit in rulWordsMask
-        ULONG ulTargetWord          = rInst.usTargetWord;
+        ULONG ulTargetWord           = rInst.usTargetWord;
         pTargetStates[ulTargetWord] |= rInst.ullTargetBits;
         rulWordsMask                |= (1ULL << (ulTargetWord & 63));
 
@@ -1944,7 +2034,7 @@ private:
             const EXTRA_TARGET_WORD* __restrict pExtra = &m_pExtraTargets[rInst.ulExtraOffset & ~NFA_INST_LITERAL_RUN_FLAG];
             for (ULONG e = 0; e < rInst.usExtraCount; e++)
             {
-                ULONG ulExtraWord          = pExtra[e].ulTargetWord;
+                ULONG ulExtraWord           = pExtra[e].ulTargetWord;
                 pTargetStates[ulExtraWord] |= pExtra[e].ullTargetBits;
                 rulWordsMask               |= (1ULL << (ulExtraWord & 63));
             }
@@ -1962,8 +2052,8 @@ private:
                                                     _Inout_                           ULONG64& __restrict               rulSuperMask) const noexcept
     {
         // Apply primary target word and propagate dirty bits up to 2nd-level mask and 3rd-level supermask
-        ULONG ulTargetWord          = rInst.usTargetWord;
-        ULONG ulMaskIdx             = ulTargetWord >> 6;
+        ULONG ulTargetWord           = rInst.usTargetWord;
+        ULONG ulMaskIdx              = ulTargetWord >> 6;
 
         pTargetStates[ulTargetWord] |= rInst.ullTargetBits;
         pTargetWordsMask[ulMaskIdx] |= (1ULL << (ulTargetWord & 63));
@@ -1975,12 +2065,12 @@ private:
             const EXTRA_TARGET_WORD* __restrict pExtra = &m_pExtraTargets[rInst.ulExtraOffset & ~NFA_INST_LITERAL_RUN_FLAG];
             for (ULONG e = 0; e < rInst.usExtraCount; e++)
             {
-                ULONG ulExtraWord            = pExtra[e].ulTargetWord;
-                ULONG ulExtraMask            = ulExtraWord >> 6;
+                ULONG ulExtraWord              = pExtra[e].ulTargetWord;
+                ULONG ulExtraMask              = ulExtraWord >> 6;
 
-                pTargetStates[ulExtraWord]   |= pExtra[e].ullTargetBits;
+                pTargetStates[ulExtraWord]    |= pExtra[e].ullTargetBits;
                 pTargetWordsMask[ulExtraMask] |= (1ULL << (ulExtraWord & 63));
-                rulSuperMask                 |= (1ULL << (ulExtraMask & 63));
+                rulSuperMask                  |= (1ULL << (ulExtraMask & 63));
             }
         }
     }
@@ -2040,6 +2130,519 @@ private:
     }
 
     // ---------------------------------------------------------------------------------
+    // PATH A: <= 63 State Words Stack Fast-Path
+    // Outlined from ExecuteVm so Path B does not pay for stack state buffers and small
+    // automata (<= 16 state words) execute with a minimal kernel stack frame.
+    // Maintains all active states on the stack and tracks non-zero state words
+    // inside a single 64-bit register (ulCurrentWordsMask).
+    // ---------------------------------------------------------------------------------
+    template <BOOLEAN bCaseInsensitive, ULONG MaxStackWords>
+    __declspec(noinline)
+    _IRQL_requires_max_(DISPATCH_LEVEL)
+    BOOLEAN ExecuteVmStackFastPath(_When_(cchLen > 0, _In_reads_(cchLen))
+                                   _When_(cchLen == 0, _In_opt_)
+                                                                  const TChar* __restrict pszText,
+                                   _In_                           size_t                  cchLen,
+                                   _Out_writes_opt_(ulMaxMatches) TContext* __restrict    pOutContexts,
+                                   _In_                           ULONG                   ulMaxMatches,
+                                   _Out_opt_                      ULONG* __restrict       pulMatchCount,
+                                   _In_                           BOOLEAN                 bMatchFirst) const noexcept
+    {
+        size_t                            cchOffset     = m_ulPrefixLength;
+        const ULONG64* __restrict         pulInitStates = m_pulInitialStates;
+        const ULONG64* __restrict         pulInitMask   = GetInitialWordsMask();
+        const NFA_INSTRUCTION* __restrict pInstructions = m_pInstructions;
+
+        ULONG64  StatesBufferA[MaxStackWords];
+        ULONG64  StatesBufferB[MaxStackWords];
+
+        ULONG64* pCurrentStates     = StatesBufferA;
+        ULONG64* pNextStates        = StatesBufferB;
+        SIZE_T   cbStateBytes       = static_cast<SIZE_T>(m_ulStateWords64) * sizeof(ULONG64);
+
+        RtlCopyMemory(pCurrentStates, pulInitStates, cbStateBytes);
+        RtlZeroMemory(pNextStates, cbStateBytes);
+
+        ULONG64  ulCurrentWordsMask = pulInitMask[0];
+        ULONG64  ulNextWordsMask    = 0;
+
+        if (ulCurrentWordsMask == 0)
+        {
+            return FALSE;
+        }
+
+        while (cchOffset < cchLen)
+        {
+            // Single consolidated early-exit check covering initial states,
+            // post-literal-run states, and per-character transition states.
+            if (CheckWord0PermanentAccept(pCurrentStates[0], bMatchFirst, pOutContexts))
+            {
+                return TRUE;
+            }
+
+            // SWAR Optimization 2: Root & Dynamic Word-0 '*' Steady-State 64-Bit Skip
+            if (ulCurrentWordsMask == 1ULL)
+            {
+                TrySkipWord0SteadyStateSwar<bCaseInsensitive>(pCurrentStates[0],
+                                                              pszText,
+                                                              cchLen,
+                                                              &cchOffset);
+
+                if (cchOffset >= cchLen)
+                {
+                    break;
+                }
+            }
+
+            // SWAR Optimization 3A: Unbranched Literal-Run Fast-Forward when 1 state is active.
+            if ((ulCurrentWordsMask & (ulCurrentWordsMask - 1)) == 0)
+            {
+                ULONG ulSingleWordIdx = 0;
+                _BitScanForward64(&ulSingleWordIdx, ulCurrentWordsMask);
+
+                ULONG64 ullSingleWordStates = pCurrentStates[ulSingleWordIdx];
+                if ((ullSingleWordStates & (ullSingleWordStates - 1)) == 0)
+                {
+                    ULONG ulSingleBit = 0;
+                    _BitScanForward64(&ulSingleBit, ullSingleWordStates);
+
+                    const NFA_INSTRUCTION* pEndInst   = NULL;
+                    INT                    nRunStatus = TryAdvanceLiteralRunSwar<bCaseInsensitive>((ulSingleWordIdx << 6) + ulSingleBit,
+                                                                                                   pszText,
+                                                                                                   cchLen,
+                                                                                                   &cchOffset,
+                                                                                                   &pEndInst);
+
+                    if (nRunStatus < 0)
+                    {
+                        return FALSE;
+                    }
+
+                    if (nRunStatus > 0)
+                    {
+                        // Clear the single starting state and apply the end-of-run state's outgoing transitions in-place
+                        pCurrentStates[ulSingleWordIdx] = 0;
+                        ulCurrentWordsMask              = 0;
+
+                        ApplyInstructionTargetsStack(*pEndInst,
+                                                     pCurrentStates,
+                                                     ulCurrentWordsMask);
+                        continue;
+                    }
+                }
+            }
+
+            // ASCII characters (0x00..0x7F) are already case-folded inside ullAsciiMatchMask[128];
+            // only non-ASCII 16-bit WCHARs (>= 0x80) require runtime UpcaseChar() translation.
+            TChar ch = pszText[cchOffset++];
+            if constexpr (bCaseInsensitive && sizeof(TChar) == 2)
+            {
+                if (static_cast<USHORT>(ch) >= 0x80) [[unlikely]]
+                {
+                    ch = UpcaseChar(ch);
+                }
+            }
+
+            // Scoped restricted aliases valid strictly for this character step prior to buffer swap
+            {
+                ULONG64* __restrict pCurStates   = pCurrentStates;
+                ULONG64* __restrict pNxtStates   = pNextStates;
+                ULONG64             ulActiveMask = ulCurrentWordsMask;
+
+                // Iterate only over non-zero 64-bit state words using Kernighan bit-clearing
+                while (ulActiveMask != 0)
+                {
+                    ULONG ulWordIdx = 0;
+                    _BitScanForward64(&ulWordIdx, ulActiveMask);
+                    ulActiveMask &= (ulActiveMask - 1);
+
+                    // Consume and zero pCurStates[ulWordIdx] inline so it is clean when buffers swap
+                    ULONG64 ulRawStates   = pCurStates[ulWordIdx];
+                    pCurStates[ulWordIdx] = 0;
+
+                    // SWAR Optimization 4: Filter all 64 states in parallel before bit-scan
+                    ULONG64 ulActiveStates = FilterActiveStatesSwar(ulWordIdx, ulRawStates, ch);
+                    ULONG   ulBaseStateIdx = ulWordIdx << 6;
+
+                    while (ulActiveStates != 0)
+                    {
+                        ULONG ulStateBit = 0;
+                        _BitScanForward64(&ulStateBit, ulActiveStates);
+                        ulActiveStates &= (ulActiveStates - 1);
+
+                        ApplyInstructionTargetsStack(pInstructions[ulBaseStateIdx + ulStateBit],
+                                                     pNxtStates,
+                                                     ulNextWordsMask);
+                    }
+                }
+            }
+
+            // Single-instruction early exit if all active states died out
+            if (!ulNextWordsMask)
+            {
+                return FALSE;
+            }
+
+            // Swap current and next state buffers for the next input character
+            ULONG64* pTempStates = pCurrentStates;
+            pCurrentStates       = pNextStates;
+            pNextStates          = pTempStates;
+
+            ulCurrentWordsMask   = ulNextWordsMask;
+            ulNextWordsMask      = 0;
+        }
+
+        // Extract matched pattern contexts from surviving accepting states
+        ULONG ulMatched = 0;
+
+        while (ulCurrentWordsMask != 0)
+        {
+            ULONG ulWordIdx = 0;
+            _BitScanForward64(&ulWordIdx, ulCurrentWordsMask);
+            ulCurrentWordsMask &= (ulCurrentWordsMask - 1);
+
+            if (HarvestWordMatches(ulWordIdx,
+                                   pCurrentStates[ulWordIdx],
+                                   pOutContexts,
+                                   ulMaxMatches,
+                                   ulMatched,
+                                   bMatchFirst))
+            {
+                return TRUE;
+            }
+        }
+
+        if (pulMatchCount != NULL)
+        {
+            *pulMatchCount = ulMatched;
+        }
+
+        return (ulMatched > 0);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // PATH B: > 63 State Words Hierarchical ulSuperMask Path
+    // Outlined from ExecuteVm to avoid allocating Path A's stack buffers on its frame.
+    // Uses a 64-bit register (ulSuperMask) where bit m indicates that
+    // pCurrentWordsMask[m] is non-zero. Uses a lock-free pre-zeroed member scratch
+    // buffer with sparse ulSuperMask initialization and cleanup.
+    // ---------------------------------------------------------------------------------
+    template <BOOLEAN bCaseInsensitive>
+    __declspec(noinline)
+    _IRQL_requires_max_(DISPATCH_LEVEL)
+    BOOLEAN ExecuteVmSuperMaskPath(_When_(cchLen > 0, _In_reads_(cchLen))
+                                   _When_(cchLen == 0, _In_opt_)
+                                                                  const TChar* __restrict pszText,
+                                   _In_                           size_t                  cchLen,
+                                   _Out_writes_opt_(ulMaxMatches) TContext* __restrict    pOutContexts,
+                                   _In_                           ULONG                   ulMaxMatches,
+                                   _Out_opt_                      ULONG* __restrict       pulMatchCount,
+                                   _In_                           BOOLEAN                 bMatchFirst) const noexcept
+    {
+        ULONG64 ulInitSuper = m_ulInitialSuperMask;
+        if (!ulInitSuper)
+        {
+            return FALSE;
+        }
+
+        size_t                            cchOffset           = m_ulPrefixLength;
+        const ULONG64* __restrict         pulInitStates       = m_pulInitialStates;
+        const ULONG64* __restrict         pulInitMask         = GetInitialWordsMask();
+        const NFA_INSTRUCTION* __restrict pInstructions       = m_pInstructions;
+        ULONG                             ulActiveMaskWords64 = GetActiveMaskWords64();
+        SIZE_T                            cbScratchWords      = static_cast<SIZE_T>(m_ulStateWords64 + ulActiveMaskWords64) * 2;
+        ULONG64* __restrict               pScratchBase        = NULL;
+        BOOLEAN                           bUsingMemberBuffer  = FALSE;
+
+        // Attempt lock-free acquisition of the pre-zeroed member scratch buffer;
+        // fall back to a per-call non-paged pool allocation under concurrency.
+        // Uses Acquire semantics to prevent ARM64 from hoisting scratch buffer reads/writes.
+        if (m_pulScratchStateBuffer != NULL &&
+            InterlockedCompareExchangeAcquire(&m_lScratchBufferInUse, 1, 0) == 0)
+        {
+            pScratchBase       = m_pulScratchStateBuffer;
+            bUsingMemberBuffer = TRUE;
+        }
+        else
+        {
+            pScratchBase = static_cast<ULONG64*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                                 cbScratchWords * sizeof(ULONG64),
+                                                                 NFA_POOL_TAG));
+
+            if (pScratchBase == NULL)
+            {
+                return FALSE;
+            }
+        }
+
+        // Partition the scratch allocation into double-buffered state and 2nd-level mask arrays
+        ULONG64* pCurrentStates    = pScratchBase;
+        ULONG64* pNextStates       = pScratchBase + m_ulStateWords64;
+        ULONG64* pCurrentWordsMask = pNextStates + m_ulStateWords64;
+        ULONG64* pNextWordsMask    = pCurrentWordsMask + ulActiveMaskWords64;
+
+        ULONG64  ulSuperMask       = ulInitSuper;
+        ULONG64  ulNextSuperMask   = 0;
+
+        // Sparse ulSuperMask initialization: touch only active mask and state words
+        ULONG64  ulInitSuperWalk = ulInitSuper;
+        while (ulInitSuperWalk != 0)
+        {
+            ULONG ulM = 0;
+            _BitScanForward64(&ulM, ulInitSuperWalk);
+            ulInitSuperWalk &= (ulInitSuperWalk - 1);
+
+            ULONG64 ulWordsMask    = pulInitMask[ulM];
+            pCurrentWordsMask[ulM] = ulWordsMask;
+            ULONG   ulBaseWordIdx  = ulM << 6;
+
+            while (ulWordsMask != 0)
+            {
+                ULONG ulWordBit = 0;
+                _BitScanForward64(&ulWordBit, ulWordsMask);
+                ulWordsMask &= (ulWordsMask - 1);
+
+                ULONG ulWordIdx           = ulBaseWordIdx + ulWordBit;
+                pCurrentStates[ulWordIdx] = pulInitStates[ulWordIdx];
+            }
+        }
+
+        // Helper lambda performing sparse ulSuperMask cleanup before releasing scratch buffer
+        // so the member buffer remains strictly pre-zeroed for the next caller.
+        // Uses WriteRelease so all zeroing writes are globally visible on ARM64/x64
+        // before m_lScratchBufferInUse is cleared.
+        auto ReleaseScratchBuffer = [&]() noexcept -> VOID
+        {
+            if (bUsingMemberBuffer)
+            {
+                while (ulSuperMask != 0)
+                {
+                    ULONG ulM = 0;
+                    _BitScanForward64(&ulM, ulSuperMask);
+                    ulSuperMask &= (ulSuperMask - 1);
+
+                    ULONG64 ulWordsMask    = pCurrentWordsMask[ulM];
+                    pCurrentWordsMask[ulM] = 0;
+                    ULONG   ulBaseWordIdx  = ulM << 6;
+
+                    while (ulWordsMask != 0)
+                    {
+                        ULONG ulWordBit = 0;
+                        _BitScanForward64(&ulWordBit, ulWordsMask);
+                        ulWordsMask &= (ulWordsMask - 1);
+
+                        pCurrentStates[ulBaseWordIdx + ulWordBit] = 0;
+                    }
+                }
+
+                WriteRelease(&m_lScratchBufferInUse, 0);
+            }
+            else
+            {
+                ExFreePoolWithTag(pScratchBase, NFA_POOL_TAG);
+            }
+        };
+
+        while (cchOffset < cchLen)
+        {
+            // Single consolidated early-exit check covering initial states,
+            // post-literal-run states, and per-character transition states.
+            if (CheckWord0PermanentAccept(pCurrentStates[0], bMatchFirst, pOutContexts))
+            {
+                ReleaseScratchBuffer();
+                return TRUE;
+            }
+
+            // SWAR Optimization 2: Root & Dynamic Word-0 '*' Steady-State 64-Bit Skip
+            if (ulSuperMask == 1ULL && pCurrentWordsMask[0] == 1ULL)
+            {
+                TrySkipWord0SteadyStateSwar<bCaseInsensitive>(pCurrentStates[0],
+                                                              pszText,
+                                                              cchLen,
+                                                              &cchOffset);
+                if (cchOffset >= cchLen)
+                {
+                    break;
+                }
+            }
+
+            // SWAR Optimization 3A: Unbranched Literal-Run Fast-Forward when 1 state is active
+            if ((ulSuperMask & (ulSuperMask - 1)) == 0)
+            {
+                ULONG ulSingleM = 0;
+                _BitScanForward64(&ulSingleM, ulSuperMask);
+
+                ULONG64 ullSingleWordsMask = pCurrentWordsMask[ulSingleM];
+                if ((ullSingleWordsMask & (ullSingleWordsMask - 1)) == 0)
+                {
+                    ULONG ulSingleWordBit = 0;
+                    _BitScanForward64(&ulSingleWordBit, ullSingleWordsMask);
+
+                    ULONG   ulSingleWordIdx     = (ulSingleM << 6) + ulSingleWordBit;
+                    ULONG64 ullSingleWordStates = pCurrentStates[ulSingleWordIdx];
+
+                    if ((ullSingleWordStates & (ullSingleWordStates - 1)) == 0)
+                    {
+                        ULONG ulSingleBit = 0;
+                        _BitScanForward64(&ulSingleBit, ullSingleWordStates);
+
+                        const NFA_INSTRUCTION* pEndInst   = NULL;
+                        INT                    nRunStatus = TryAdvanceLiteralRunSwar<bCaseInsensitive>((ulSingleWordIdx << 6) + ulSingleBit,
+                                                                                                       pszText,
+                                                                                                       cchLen,
+                                                                                                       &cchOffset,
+                                                                                                       &pEndInst);
+
+                        if (nRunStatus < 0)
+                        {
+                            ReleaseScratchBuffer();
+                            return FALSE;
+                        }
+
+                        if (nRunStatus > 0)
+                        {
+                            // Clear the single active state across all 3 hierarchy levels and apply end-of-run targets
+                            pCurrentStates[ulSingleWordIdx] = 0;
+                            pCurrentWordsMask[ulSingleM]    = 0;
+                            ulSuperMask                     = 0;
+
+                            ApplyInstructionTargetsSuper(*pEndInst,
+                                                         pCurrentStates,
+                                                         pCurrentWordsMask,
+                                                         ulSuperMask);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // ASCII characters (0x00..0x7F) are already case-folded inside ullAsciiMatchMask[128];
+            // only non-ASCII 16-bit WCHARs (>= 0x80) require runtime UpcaseChar() translation.
+            TChar ch = pszText[cchOffset++];
+            if constexpr (bCaseInsensitive && sizeof(TChar) == 2)
+            {
+                if (static_cast<USHORT>(ch) >= 0x80) [[unlikely]]
+                {
+                    ch = UpcaseChar(ch);
+                }
+            }
+
+            // Scoped restricted aliases valid strictly for this character step prior to buffer swap
+            {
+                ULONG64* __restrict pCurStates    = pCurrentStates;
+                ULONG64* __restrict pNxtStates    = pNextStates;
+                ULONG64* __restrict pCurWordsMask = pCurrentWordsMask;
+                ULONG64* __restrict pNxtWordsMask = pNextWordsMask;
+                ULONG64             ulActiveSuper = ulSuperMask;
+
+                // Traverse the 3-level hierarchy (SuperMask -> WordsMask -> StateWord), zeroing consumed words inline
+                while (ulActiveSuper != 0)
+                {
+                    ULONG ulM = 0;
+                    _BitScanForward64(&ulM, ulActiveSuper);
+                    ulActiveSuper &= (ulActiveSuper - 1);
+
+                    ULONG64 ulWordsMask   = pCurWordsMask[ulM];
+                    pCurWordsMask[ulM]    = 0;
+                    ULONG   ulBaseWordIdx = ulM << 6;
+
+                    while (ulWordsMask != 0)
+                    {
+                        ULONG ulWordBit = 0;
+                        _BitScanForward64(&ulWordBit, ulWordsMask);
+                        ulWordsMask &= (ulWordsMask - 1);
+
+                        ULONG   ulWordIdx      = ulBaseWordIdx + ulWordBit;
+                        ULONG64 ulRawStates    = pCurStates[ulWordIdx];
+                        pCurStates[ulWordIdx]  = 0;
+
+                        // SWAR Optimization 4: Filter all 64 states in parallel before bit-scan
+                        ULONG64 ulActiveStates = FilterActiveStatesSwar(ulWordIdx, ulRawStates, ch);
+                        ULONG   ulBaseStateIdx = ulWordIdx << 6;
+
+                        while (ulActiveStates != 0)
+                        {
+                            ULONG ulStateBit = 0;
+                            _BitScanForward64(&ulStateBit, ulActiveStates);
+                            ulActiveStates &= (ulActiveStates - 1);
+
+                            ApplyInstructionTargetsSuper(pInstructions[ulBaseStateIdx + ulStateBit],
+                                                         pNxtStates,
+                                                         pNxtWordsMask,
+                                                         ulNextSuperMask);
+                        }
+                    }
+                }
+            }
+
+            // Single-instruction early exit check when all states die out
+            // Note: pCurrentStates and pCurrentWordsMask were zeroed inline above
+            if (!ulNextSuperMask)
+            {
+                ulSuperMask = 0;
+                ReleaseScratchBuffer();
+                return FALSE;
+            }
+
+            // Swap current and next state and 2nd-level mask buffers for the next character step
+            ULONG64* pTempStates = pCurrentStates;
+            pCurrentStates       = pNextStates;
+            pNextStates          = pTempStates;
+
+            ULONG64* pTempMask   = pCurrentWordsMask;
+            pCurrentWordsMask    = pNextWordsMask;
+            pNextWordsMask       = pTempMask;
+
+            ulSuperMask          = ulNextSuperMask;
+            ulNextSuperMask      = 0;
+        }
+
+        // Extract matched pattern contexts using a copy of ulSuperMask so
+        // ReleaseScratchBuffer() can perform sparse cleanup uniformly
+        ULONG   ulMatched     = 0;
+        ULONG64 ulAcceptSuper = ulSuperMask;
+
+        while (ulAcceptSuper != 0)
+        {
+            ULONG ulM = 0;
+            _BitScanForward64(&ulM, ulAcceptSuper);
+            ulAcceptSuper &= (ulAcceptSuper - 1);
+
+            ULONG64 ulWordsMask   = pCurrentWordsMask[ulM];
+            ULONG   ulBaseWordIdx = ulM << 6;
+
+            while (ulWordsMask != 0)
+            {
+                ULONG ulWordBit = 0;
+                _BitScanForward64(&ulWordBit, ulWordsMask);
+                ulWordsMask &= (ulWordsMask - 1);
+
+                ULONG ulWordIdx = ulBaseWordIdx + ulWordBit;
+
+                if (HarvestWordMatches(ulWordIdx,
+                                       pCurrentStates[ulWordIdx],
+                                       pOutContexts,
+                                       ulMaxMatches,
+                                       ulMatched,
+                                       bMatchFirst))
+                {
+                    ReleaseScratchBuffer();
+                    return TRUE;
+                }
+            }
+        }
+
+        ReleaseScratchBuffer();
+
+        if (pulMatchCount != NULL)
+        {
+            *pulMatchCount = ulMatched;
+        }
+
+        return (ulMatched > 0);
+    }
+
+    // ---------------------------------------------------------------------------------
     // Core VM execution engine shared by MatchFirst and MatchAll.
     // Integrates register-direct 64-bit SWAR scanning, dynamic Word-0 steady-state
     // skipping, permanent accept early-exit, unbranched literal-run fast-forwarding,
@@ -2047,7 +2650,7 @@ private:
     // ---------------------------------------------------------------------------------
     template <BOOLEAN bCaseInsensitive>
     _IRQL_requires_max_(DISPATCH_LEVEL)
-    BOOLEAN ExecuteVm(_In_reads_or_z_(cchLen)        const TChar* __restrict pszText,
+    BOOLEAN ExecuteVm(_In_reads_opt_(cchLen)         const TChar* __restrict pszText,
                       _In_                           size_t                  cchLen,
                       _Out_writes_opt_(ulMaxMatches) TContext* __restrict    pOutContexts,
                       _In_                           ULONG                   ulMaxMatches,
@@ -2078,491 +2681,33 @@ private:
             return FALSE;
         }
 
-        size_t                            cchOffset     = m_ulPrefixLength;
-        const ULONG64* __restrict         pulInitStates = m_pulInitialStates;
-        const ULONG64* __restrict         pulInitMask   = GetInitialWordsMask();
-        const NFA_INSTRUCTION* __restrict pInstructions = m_pInstructions;
-        ULONG64                           ulInitSuper   = m_ulInitialSuperMask;
+        // Dispatch to outlined Path A (tiered stack fast-path) or Path B (ulSuperMask path)
+        if (m_ulStateWords64 <= STACK_SMALL_FAST_PATH_WORDS)
+        {
+            return ExecuteVmStackFastPath<bCaseInsensitive, STACK_SMALL_FAST_PATH_WORDS>(pszText,
+                                                                                         cchLen,
+                                                                                         pOutContexts,
+                                                                                         ulMaxMatches,
+                                                                                         pulMatchCount,
+                                                                                         bMatchFirst);
+        }
 
-        // -----------------------------------------------------------------------------
-        // PATH A: <= 63 State Words Stack Fast-Path
-        // Maintains all active states on the stack and tracks non-zero state words
-        // inside a single 64-bit register (ulCurrentWordsMask).
-        // -----------------------------------------------------------------------------
         if (m_ulStateWords64 <= STACK_FAST_PATH_WORDS)
         {
-            ULONG64  StatesBufferA[STACK_FAST_PATH_WORDS];
-            ULONG64  StatesBufferB[STACK_FAST_PATH_WORDS];
-
-            ULONG64* pCurrentStates     = StatesBufferA;
-            ULONG64* pNextStates        = StatesBufferB;
-            SIZE_T   cbStateBytes       = static_cast<SIZE_T>(m_ulStateWords64) * sizeof(ULONG64);
-
-            RtlCopyMemory(pCurrentStates, pulInitStates, cbStateBytes);
-            RtlZeroMemory(pNextStates, cbStateBytes);
-
-            ULONG64  ulCurrentWordsMask = pulInitMask[0];
-            ULONG64  ulNextWordsMask    = 0;
-
-            if (ulCurrentWordsMask == 0)
-            {
-                return FALSE;
-            }
-
-            while (cchOffset < cchLen)
-            {
-                // Single consolidated early-exit check covering initial states,
-                // post-literal-run states, and per-character transition states.
-                if (CheckWord0PermanentAccept(pCurrentStates[0], bMatchFirst, pOutContexts))
-                {
-                    return TRUE;
-                }
-
-                // SWAR Optimization 2: Root & Dynamic Word-0 '*' Steady-State 64-Bit Skip
-                if (ulCurrentWordsMask == 1ULL)
-                {
-                    TrySkipWord0SteadyStateSwar<bCaseInsensitive>(pCurrentStates[0],
-                                                                  pszText,
-                                                                  cchLen,
-                                                                  &cchOffset);
-
-                    if (cchOffset >= cchLen)
-                    {
-                        break;
-                    }
-                }
-
-                // SWAR Optimization 3A: Unbranched Literal-Run Fast-Forward when 1 state is active.                
-                if ((ulCurrentWordsMask & (ulCurrentWordsMask - 1)) == 0)
-                {
-                    ULONG ulSingleWordIdx = 0;
-                    _BitScanForward64(&ulSingleWordIdx, ulCurrentWordsMask);
-
-                    ULONG64 ullSingleWordStates = pCurrentStates[ulSingleWordIdx];
-                    if ((ullSingleWordStates & (ullSingleWordStates - 1)) == 0)
-                    {
-                        ULONG ulSingleBit = 0;
-                        _BitScanForward64(&ulSingleBit, ullSingleWordStates);
-
-                        const NFA_INSTRUCTION* pEndInst   = NULL;
-                        INT                    nRunStatus = TryAdvanceLiteralRunSwar<bCaseInsensitive>((ulSingleWordIdx << 6) + ulSingleBit,
-                                                                                                       pszText,
-                                                                                                       cchLen,
-                                                                                                       &cchOffset,
-                                                                                                       &pEndInst);
-
-                        if (nRunStatus < 0)
-                        {
-                            return FALSE;
-                        }
-
-                        if (nRunStatus > 0)
-                        {
-                            // Clear the single starting state and apply the end-of-run state's outgoing transitions in-place
-                            pCurrentStates[ulSingleWordIdx] = 0;
-                            ulCurrentWordsMask              = 0;
-
-                            ApplyInstructionTargetsStack(*pEndInst,
-                                                         pCurrentStates,
-                                                         ulCurrentWordsMask);
-                            continue;
-                        }
-                    }
-                }
-
-                // ASCII characters (0x00..0x7F) are already case-folded inside ullAsciiMatchMask[128];
-                // only non-ASCII 16-bit WCHARs (>= 0x80) require runtime UpcaseChar() translation.
-                TChar ch = pszText[cchOffset++];
-                if constexpr (bCaseInsensitive && sizeof(TChar) == 2)
-                {
-                    if (static_cast<USHORT>(ch) >= 0x80) [[unlikely]]
-                    {
-                        ch = UpcaseChar(ch);
-                    }
-                }
-
-                // Scoped restricted aliases valid strictly for this character step prior to buffer swap
-                {
-                    ULONG64* __restrict pCurStates   = pCurrentStates;
-                    ULONG64* __restrict pNxtStates   = pNextStates;
-                    ULONG64             ulActiveMask = ulCurrentWordsMask;
-
-                    // Iterate only over non-zero 64-bit state words using Kernighan bit-clearing
-                    while (ulActiveMask != 0)
-                    {
-                        ULONG ulWordIdx = 0;
-                        _BitScanForward64(&ulWordIdx, ulActiveMask);
-                        ulActiveMask &= (ulActiveMask - 1);
-
-                        // Consume and zero pCurStates[ulWordIdx] inline so it is clean when buffers swap
-                        ULONG64 ulRawStates   = pCurStates[ulWordIdx];
-                        pCurStates[ulWordIdx] = 0;
-
-                        // SWAR Optimization 4: Filter all 64 states in parallel before bit-scan
-                        ULONG64 ulActiveStates = FilterActiveStatesSwar(ulWordIdx, ulRawStates, ch);
-                        ULONG   ulBaseStateIdx = ulWordIdx << 6;
-
-                        while (ulActiveStates != 0)
-                        {
-                            ULONG ulStateBit = 0;
-                            _BitScanForward64(&ulStateBit, ulActiveStates);
-                            ulActiveStates &= (ulActiveStates - 1);
-
-                            ApplyInstructionTargetsStack(pInstructions[ulBaseStateIdx + ulStateBit],
-                                                         pNxtStates,
-                                                         ulNextWordsMask);
-                        }
-                    }
-                }
-
-                // Single-instruction early exit if all active states died out
-                if (!ulNextWordsMask)
-                {
-                    return FALSE;
-                }
-
-                // Swap current and next state buffers for the next input character
-                ULONG64* pTempStates = pCurrentStates;
-                pCurrentStates       = pNextStates;
-                pNextStates          = pTempStates;
-
-                ulCurrentWordsMask   = ulNextWordsMask;
-                ulNextWordsMask      = 0;
-            }
-
-            // Extract matched pattern contexts from surviving accepting states
-            ULONG ulMatched = 0;
-
-            while (ulCurrentWordsMask != 0)
-            {
-                ULONG ulWordIdx = 0;
-                _BitScanForward64(&ulWordIdx, ulCurrentWordsMask);
-                ulCurrentWordsMask &= (ulCurrentWordsMask - 1);
-
-                if (HarvestWordMatches(ulWordIdx,
-                                       pCurrentStates[ulWordIdx],
-                                       pOutContexts,
-                                       ulMaxMatches,
-                                       ulMatched,
-                                       bMatchFirst))
-                {
-                    return TRUE;
-                }
-            }
-
-            if (pulMatchCount != NULL)
-            {
-                *pulMatchCount = ulMatched;
-            }
-
-            return (ulMatched > 0);
+            return ExecuteVmStackFastPath<bCaseInsensitive, STACK_FAST_PATH_WORDS>(pszText,
+                                                                                   cchLen,
+                                                                                   pOutContexts,
+                                                                                   ulMaxMatches,
+                                                                                   pulMatchCount,
+                                                                                   bMatchFirst);
         }
 
-        // -----------------------------------------------------------------------------
-        // PATH B: > 63 State Words Hierarchical ulSuperMask Path
-        // Uses a 64-bit register (ulSuperMask) where bit m indicates that
-        // pCurrentWordsMask[m] is non-zero. Uses a lock-free pre-zeroed member scratch
-        // buffer with sparse ulSuperMask initialization and cleanup.
-        // -----------------------------------------------------------------------------
-        else
-        {
-            if (!ulInitSuper)
-            {
-                return FALSE;
-            }
-
-            ULONG               ulActiveMaskWords64 = GetActiveMaskWords64();
-            SIZE_T              cbScratchWords      = static_cast<SIZE_T>(m_ulStateWords64 + ulActiveMaskWords64) * 2;
-            ULONG64* __restrict pScratchBase        = NULL;
-            BOOLEAN             bUsingMemberBuffer  = FALSE;
-
-            // Attempt lock-free acquisition of the pre-zeroed member scratch buffer;
-            // fall back to a per-call non-paged pool allocation under concurrency.
-            // Uses Acquire semantics to prevent ARM64 from hoisting scratch buffer reads/writes.
-            if (m_pulScratchStateBuffer != NULL &&
-                InterlockedCompareExchangeAcquire(&m_lScratchBufferInUse, 1, 0) == 0)
-            {
-                pScratchBase       = m_pulScratchStateBuffer;
-                bUsingMemberBuffer = TRUE;
-            }
-            else
-            {
-                pScratchBase = static_cast<ULONG64*>(ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                                                     cbScratchWords * sizeof(ULONG64),
-                                                                     NFA_POOL_TAG));
-
-                if (pScratchBase == NULL)
-                {
-                    return FALSE;
-                }
-            }
-
-            // Partition the scratch allocation into double-buffered state and 2nd-level mask arrays
-            ULONG64* pCurrentStates    = pScratchBase;
-            ULONG64* pNextStates       = pScratchBase + m_ulStateWords64;
-            ULONG64* pCurrentWordsMask = pNextStates + m_ulStateWords64;
-            ULONG64* pNextWordsMask    = pCurrentWordsMask + ulActiveMaskWords64;
-
-            ULONG64  ulSuperMask       = ulInitSuper;
-            ULONG64  ulNextSuperMask   = 0;
-
-            // Sparse ulSuperMask initialization: touch only active mask and state words
-            ULONG64  ulInitSuperWalk = ulInitSuper;
-            while (ulInitSuperWalk != 0)
-            {
-                ULONG ulM = 0;
-                _BitScanForward64(&ulM, ulInitSuperWalk);
-                ulInitSuperWalk &= (ulInitSuperWalk - 1);
-
-                ULONG64 ulWordsMask    = pulInitMask[ulM];
-                pCurrentWordsMask[ulM] = ulWordsMask;
-                ULONG   ulBaseWordIdx  = ulM << 6;
-
-                while (ulWordsMask != 0)
-                {
-                    ULONG ulWordBit = 0;
-                    _BitScanForward64(&ulWordBit, ulWordsMask);
-                    ulWordsMask &= (ulWordsMask - 1);
-
-                    ULONG ulWordIdx           = ulBaseWordIdx + ulWordBit;
-                    pCurrentStates[ulWordIdx] = pulInitStates[ulWordIdx];
-                }
-            }
-
-            // Helper lambda performing sparse ulSuperMask cleanup before releasing scratch buffer
-            // so the member buffer remains strictly pre-zeroed for the next caller.
-            // Uses WriteRelease so all zeroing writes are globally visible on ARM64/x64
-            // before m_lScratchBufferInUse is cleared.
-            auto ReleaseScratchBuffer = [&]() noexcept -> VOID
-            {
-                if (bUsingMemberBuffer)
-                {
-                    while (ulSuperMask != 0)
-                    {
-                        ULONG ulM = 0;
-                        _BitScanForward64(&ulM, ulSuperMask);
-                        ulSuperMask &= (ulSuperMask - 1);
-
-                        ULONG64 ulWordsMask    = pCurrentWordsMask[ulM];
-                        pCurrentWordsMask[ulM] = 0;
-                        ULONG   ulBaseWordIdx  = ulM << 6;
-
-                        while (ulWordsMask != 0)
-                        {
-                            ULONG ulWordBit = 0;
-                            _BitScanForward64(&ulWordBit, ulWordsMask);
-                            ulWordsMask &= (ulWordsMask - 1);
-
-                            pCurrentStates[ulBaseWordIdx + ulWordBit] = 0;
-                        }
-                    }
-
-                    WriteRelease(&m_lScratchBufferInUse, 0);
-                }
-                else
-                {
-                    ExFreePoolWithTag(pScratchBase, NFA_POOL_TAG);
-                }
-            };
-
-            while (cchOffset < cchLen)
-            {
-                // Single consolidated early-exit check covering initial states,
-                // post-literal-run states, and per-character transition states.
-                if (CheckWord0PermanentAccept(pCurrentStates[0], bMatchFirst, pOutContexts))
-                {
-                    ReleaseScratchBuffer();
-                    return TRUE;
-                }
-
-                // SWAR Optimization 2: Root & Dynamic Word-0 '*' Steady-State 64-Bit Skip
-                if (ulSuperMask == 1ULL && pCurrentWordsMask[0] == 1ULL)
-                {
-                    TrySkipWord0SteadyStateSwar<bCaseInsensitive>(pCurrentStates[0],
-                                                                  pszText,
-                                                                  cchLen,
-                                                                  &cchOffset);
-                    if (cchOffset >= cchLen)
-                    {
-                        break;
-                    }
-                }
-
-                // SWAR Optimization 3A: Unbranched Literal-Run Fast-Forward when 1 state is active                
-                if ((ulSuperMask & (ulSuperMask - 1)) == 0)
-                {
-                    ULONG ulSingleM = 0;
-                    _BitScanForward64(&ulSingleM, ulSuperMask);
-
-                    ULONG64 ullSingleWordsMask = pCurrentWordsMask[ulSingleM];
-                    if ((ullSingleWordsMask & (ullSingleWordsMask - 1)) == 0)
-                    {
-                        ULONG ulSingleWordBit = 0;
-                        _BitScanForward64(&ulSingleWordBit, ullSingleWordsMask);
-
-                        ULONG   ulSingleWordIdx     = (ulSingleM << 6) + ulSingleWordBit;
-                        ULONG64 ullSingleWordStates = pCurrentStates[ulSingleWordIdx];
-
-                        if ((ullSingleWordStates & (ullSingleWordStates - 1)) == 0)
-                        {
-                            ULONG ulSingleBit = 0;
-                            _BitScanForward64(&ulSingleBit, ullSingleWordStates);
-
-                            const NFA_INSTRUCTION* pEndInst   = NULL;
-                            INT                    nRunStatus = TryAdvanceLiteralRunSwar<bCaseInsensitive>((ulSingleWordIdx << 6) + ulSingleBit,
-                                                                                                           pszText,
-                                                                                                           cchLen,
-                                                                                                           &cchOffset,
-                                                                                                           &pEndInst);
-
-                            if (nRunStatus < 0)
-                            {
-                                ReleaseScratchBuffer();
-                                return FALSE;
-                            }
-
-                            if (nRunStatus > 0)
-                            {
-                                // Clear the single active state across all 3 hierarchy levels and apply end-of-run targets
-                                pCurrentStates[ulSingleWordIdx] = 0;
-                                pCurrentWordsMask[ulSingleM]    = 0;
-                                ulSuperMask                     = 0;
-
-                                ApplyInstructionTargetsSuper(*pEndInst,
-                                                             pCurrentStates,
-                                                             pCurrentWordsMask,
-                                                             ulSuperMask);
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // ASCII characters (0x00..0x7F) are already case-folded inside ullAsciiMatchMask[128];
-                // only non-ASCII 16-bit WCHARs (>= 0x80) require runtime UpcaseChar() translation.
-                TChar ch = pszText[cchOffset++];
-                if constexpr (bCaseInsensitive && sizeof(TChar) == 2)
-                {
-                    if (static_cast<USHORT>(ch) >= 0x80) [[unlikely]]
-                    {
-                        ch = UpcaseChar(ch);
-                    }
-                }
-
-                // Scoped restricted aliases valid strictly for this character step prior to buffer swap
-                {
-                    ULONG64* __restrict pCurStates    = pCurrentStates;
-                    ULONG64* __restrict pNxtStates    = pNextStates;
-                    ULONG64* __restrict pCurWordsMask = pCurrentWordsMask;
-                    ULONG64* __restrict pNxtWordsMask = pNextWordsMask;
-                    ULONG64             ulActiveSuper = ulSuperMask;
-
-                    // Traverse the 3-level hierarchy (SuperMask -> WordsMask -> StateWord), zeroing consumed words inline
-                    while (ulActiveSuper != 0)
-                    {
-                        ULONG ulM = 0;
-                        _BitScanForward64(&ulM, ulActiveSuper);
-                        ulActiveSuper &= (ulActiveSuper - 1);
-
-                        ULONG64 ulWordsMask   = pCurWordsMask[ulM];
-                        pCurWordsMask[ulM]    = 0;
-                        ULONG   ulBaseWordIdx = ulM << 6;
-
-                        while (ulWordsMask != 0)
-                        {
-                            ULONG ulWordBit = 0;
-                            _BitScanForward64(&ulWordBit, ulWordsMask);
-                            ulWordsMask &= (ulWordsMask - 1);
-
-                            ULONG   ulWordIdx      = ulBaseWordIdx + ulWordBit;
-                            ULONG64 ulRawStates    = pCurStates[ulWordIdx];
-                            pCurStates[ulWordIdx]  = 0;
-
-                            // SWAR Optimization 4: Filter all 64 states in parallel before bit-scan
-                            ULONG64 ulActiveStates = FilterActiveStatesSwar(ulWordIdx, ulRawStates, ch);
-                            ULONG   ulBaseStateIdx = ulWordIdx << 6;
-
-                            while (ulActiveStates != 0)
-                            {
-                                ULONG ulStateBit = 0;
-                                _BitScanForward64(&ulStateBit, ulActiveStates);
-                                ulActiveStates &= (ulActiveStates - 1);
-
-                                ApplyInstructionTargetsSuper(pInstructions[ulBaseStateIdx + ulStateBit],
-                                                             pNxtStates,
-                                                             pNxtWordsMask,
-                                                             ulNextSuperMask);
-                            }
-                        }
-                    }
-                }
-
-                // Single-instruction early exit check when all states die out
-                // Note: pCurrentStates and pCurrentWordsMask were zeroed inline above
-                if (!ulNextSuperMask)
-                {
-                    ulSuperMask = 0;
-                    ReleaseScratchBuffer();
-                    return FALSE;
-                }
-
-                // Swap current and next state and 2nd-level mask buffers for the next character step
-                ULONG64* pTempStates = pCurrentStates;
-                pCurrentStates       = pNextStates;
-                pNextStates          = pTempStates;
-
-                ULONG64* pTempMask   = pCurrentWordsMask;
-                pCurrentWordsMask    = pNextWordsMask;
-                pNextWordsMask       = pTempMask;
-
-                ulSuperMask          = ulNextSuperMask;
-                ulNextSuperMask      = 0;
-            }
-
-            // Extract matched pattern contexts using a copy of ulSuperMask so
-            // ReleaseScratchBuffer() can perform sparse cleanup uniformly
-            ULONG   ulMatched     = 0;
-            ULONG64 ulAcceptSuper = ulSuperMask;
-
-            while (ulAcceptSuper != 0)
-            {
-                ULONG ulM = 0;
-                _BitScanForward64(&ulM, ulAcceptSuper);
-                ulAcceptSuper &= (ulAcceptSuper - 1);
-
-                ULONG64 ulWordsMask   = pCurrentWordsMask[ulM];
-                ULONG   ulBaseWordIdx = ulM << 6;
-
-                while (ulWordsMask != 0)
-                {
-                    ULONG ulWordBit = 0;
-                    _BitScanForward64(&ulWordBit, ulWordsMask);
-                    ulWordsMask &= (ulWordsMask - 1);
-
-                    ULONG ulWordIdx = ulBaseWordIdx + ulWordBit;
-
-                    if (HarvestWordMatches(ulWordIdx,
-                                           pCurrentStates[ulWordIdx],
-                                           pOutContexts,
-                                           ulMaxMatches,
-                                           ulMatched,
-                                           bMatchFirst))
-                    {
-                        ReleaseScratchBuffer();
-                        return TRUE;
-                    }
-                }
-            }
-
-            ReleaseScratchBuffer();
-
-            if (pulMatchCount != NULL)
-            {
-                *pulMatchCount = ulMatched;
-            }
-
-            return (ulMatched > 0);
-        }
+        return ExecuteVmSuperMaskPath<bCaseInsensitive>(pszText,
+                                                        cchLen,
+                                                        pOutContexts,
+                                                        ulMaxMatches,
+                                                        pulMatchCount,
+                                                        bMatchFirst);
     }
 
 public:
@@ -2570,28 +2715,29 @@ public:
     // ---------------------------------------------------------------------------------
     // Constructs an empty NFA instance configured for case-insensitive or exact mode.
     // ---------------------------------------------------------------------------------
-    explicit KmWildcardNfa(_In_ BOOLEAN bCaseInsensitive = TRUE ) noexcept : m_bCaseInsensitive(bCaseInsensitive),
-                                                                             m_bCompiled(FALSE),
-                                                                             m_ulStateWords64(0),
-                                                                             m_ulPrefixLength(0),
-                                                                             m_pInstructions(NULL),
-                                                                             m_pStateMetadata(NULL),
-                                                                             m_pWordFilters(NULL),
-                                                                             m_pExtraTargets(NULL),
-                                                                             m_pMatchLinks(NULL),
-                                                                             m_pulInitialStates(NULL),
-                                                                             m_pszLiteralRuns(NULL),
-                                                                             m_ulInitialSuperMask(0),
-                                                                             m_ullSteadyStateWord0(0),
-                                                                             m_ullStarExitBroadcast1(0),
-                                                                             m_ullStarExitBroadcast2(0),
-                                                                             m_ullWord0DefaultStarMask(0),
-                                                                             m_ullWord0PermanentAcceptMask(0),
-                                                                             m_pulScratchStateBuffer(NULL),
-                                                                             m_pPatterns(NULL),
-                                                                             m_ulPatternCount(0),
-                                                                             m_ulPatternCapacity(0),
-                                                                             m_lScratchBufferInUse(0)
+    explicit KmWildcardNfa(_In_ BOOLEAN bCaseInsensitive = TRUE) noexcept : m_bCaseInsensitive(bCaseInsensitive),
+                                                                            m_bCompiled(FALSE),
+                                                                            m_ulStateWords64(0),
+                                                                            m_ulPrefixLength(0),
+                                                                            m_pInstructions(NULL),
+                                                                            m_pStateMetadata(NULL),
+                                                                            m_pWordFilters(NULL),
+                                                                            m_pExtraTargets(NULL),
+                                                                            m_pMatchLinks(NULL),
+                                                                            m_pulInitialStates(NULL),
+                                                                            m_pszLiteralRuns(NULL),
+                                                                            m_ulInitialSuperMask(0),
+                                                                            m_ullSteadyStateWord0(0),
+                                                                            m_ullStarExitBroadcast1(0),
+                                                                            m_ullStarExitBroadcast2(0),
+                                                                            m_ullWord0DefaultStarMask(0),
+                                                                            m_ullWord0PermanentAcceptMask(0),
+                                                                            m_pulScratchStateBuffer(NULL),
+                                                                            m_pPatterns(NULL),
+                                                                            m_ulPatternCount(0),
+                                                                            m_ulPatternCapacity(0),
+                                                                            m_ScratchLatchPad{},
+                                                                            m_lScratchBufferInUse(0)
     {
     }
 
@@ -2640,10 +2786,10 @@ public:
     // m_bCaseInsensitive is enabled.
     // ---------------------------------------------------------------------------------
     _IRQL_requires_max_(APC_LEVEL)
-    NTSTATUS AddPattern(_In_reads_or_z_(cchLen) const TChar* __restrict    pszPattern,
-                        _In_                    size_t                     cchLen,
-                        _In_                    WILD_CARD_SCOPE            eScope,
-                        _In_                    const TContext& __restrict rContext) noexcept
+    NTSTATUS AddPattern(_In_reads_opt_(cchLen) const TChar* __restrict    pszPattern,
+                        _In_                   size_t                     cchLen,
+                        _In_                   WILD_CARD_SCOPE            eScope,
+                        _In_                   const TContext& __restrict rContext) noexcept
     {
         // Validate pointer, byte-size overflow limits, and wildcard scope enumerator
         if ((pszPattern == NULL && cchLen > 0) ||
@@ -2746,9 +2892,16 @@ public:
             return ntStatus;
         }
 
-        // Step 2: Assign state indices using Chain-Contiguous Sibling BFS so sibling
-        // branches remain contiguous while single-child chains pack into the same word.
-        ntStatus = AssignStateIndicesBfs(pTrieNodes, ulTrieNodeCount);
+        // Step 2: Detect any shared anchored root literal prefix and assign state indices
+        // using Chain-Contiguous Sibling BFS so sibling branches remain contiguous while
+        // single-child chains pack into the same word and live post-prefix states start in Word 0.
+        ULONG ulLastPrefNode  = 0;
+        ULONG ulRootPrefixLen = FindSharedRootLiteralPrefix(pTrieNodes, &ulLastPrefNode);
+
+        ntStatus = AssignStateIndicesBfs(pTrieNodes,
+                                         ulTrieNodeCount,
+                                         ulRootPrefixLen,
+                                         ulLastPrefNode);
         if (!NT_SUCCESS(ntStatus))
         {
             ExFreePoolWithTag(pTrieNodes, NFA_POOL_TAG);
@@ -2758,7 +2911,11 @@ public:
 
         // Step 3: Allocate and populate runtime NFA instruction, cold state metadata, and SWAR filter tables
         ULONG64* pulScratchTargetBits = NULL;
-        ntStatus = AllocateRuntimeTables(pTrieNodes, ulTrieNodeCount, &pulScratchTargetBits);
+        ULONG*   pulTouchedWords      = NULL;
+        ntStatus = AllocateRuntimeTables(pTrieNodes,
+                                         ulTrieNodeCount,
+                                         &pulScratchTargetBits,
+                                         &pulTouchedWords);
         if (!NT_SUCCESS(ntStatus))
         {
             ExFreePoolWithTag(pTrieNodes, NFA_POOL_TAG);
@@ -2766,14 +2923,22 @@ public:
             return ntStatus;
         }
 
-        PopulateInstructionsAndFilters(pTrieNodes, ulTrieNodeCount, pulScratchTargetBits);
+        PopulateInstructionsAndFilters(pTrieNodes,
+                                       ulTrieNodeCount,
+                                       pulScratchTargetBits,
+                                       pulTouchedWords);
+        ExFreePoolWithTag(pulTouchedWords, NFA_POOL_TAG);
         ExFreePoolWithTag(pulScratchTargetBits, NFA_POOL_TAG);
 
-        // Step 4: Configure SWAR Optimization 2 (Steady-State '*' 64-Bit Fast-Forward)
-        ConfigureStarSteadyStateSkip(pTrieNodes);
+        // Step 4: Configure SWAR Optimization 3 (Shared Root Literal Prefix Fast-Forward)
+        ConfigureRootLiteralPrefix(pTrieNodes,
+                                   ulTrieNodeCount,
+                                   ulRootPrefixLen,
+                                   ulLastPrefNode);
 
-        // Step 5: Configure SWAR Optimization 3 (Shared Root Literal Prefix Fast-Forward)
-        ConfigureRootLiteralPrefix(pTrieNodes, ulTrieNodeCount);
+        // Step 5: Configure SWAR Optimization 2 (Steady-State '*' 64-Bit Fast-Forward)
+        ConfigureStarSteadyStateSkip(pTrieNodes,
+                                     (m_ulPrefixLength > 0) ? ulLastPrefNode : 0);
 
         // Step 6: Build unbranched Op::Literal run tables for mid-Trie SWAR fast-forwarding
         BuildLiteralRunTables(pTrieNodes, ulTrieNodeCount);
@@ -2791,9 +2956,9 @@ public:
     // resolving the first matching pattern context.
     // ---------------------------------------------------------------------------------
     _IRQL_requires_max_(DISPATCH_LEVEL)
-    BOOLEAN MatchFirst(_In_reads_or_z_(cchLen) const TChar* __restrict pszText,
-                       _In_                    size_t                  cchLen,
-                       _Out_opt_               TContext* __restrict    pOutContext) const noexcept
+    BOOLEAN MatchFirst(_In_reads_opt_(cchLen) const TChar* __restrict pszText,
+                       _In_                   size_t                  cchLen,
+                       _Out_opt_              TContext* __restrict    pOutContext) const noexcept
     {
         if (m_bCaseInsensitive)
         {
@@ -2810,7 +2975,7 @@ public:
     // with all matching pattern contexts up to ulMaxMatches.
     // ---------------------------------------------------------------------------------
     _IRQL_requires_max_(DISPATCH_LEVEL)
-    BOOLEAN MatchAll(_In_reads_or_z_(cchLen)        const TChar* __restrict pszText,
+    BOOLEAN MatchAll(_In_reads_opt_(cchLen)         const TChar* __restrict pszText,
                      _In_                           size_t                  cchLen,
                      _Out_writes_opt_(ulMaxMatches) TContext* __restrict    pOutContexts,
                      _In_                           ULONG                   ulMaxMatches,
