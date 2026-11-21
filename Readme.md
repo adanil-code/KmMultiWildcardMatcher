@@ -148,7 +148,7 @@ Hot Compiled State Descriptor: NFA_INSTRUCTION (16 Bytes -> 4 Instructions per 6
 
 ## Quick Start API Overview
 
-`KmWildcardNfa` is header-only (`KmWildcardNfa.h`) and requires only standard WDK headers (`<ntddk.h>` and `<intrin.h>`). Instances are explicitly non-copyable (`delete`d copy constructor and copy assignment operator) to prevent shallow copies of Non-Paged Pool tables.
+`KmWildcardNfa` is header-only (`KmWildcardNfa.h`) and requires only standard WDK headers. Instances are explicitly non-copyable (`delete`d copy constructor and copy assignment operator) to prevent shallow copies of Non-Paged Pool tables.
 
 ### Pattern Syntax & Wildcard Scoping
 
@@ -316,7 +316,7 @@ NTSTATUS RunWildcardNfaExample()
     // Note: For hot-reloading rules in production, build and Compile() a new
     // KmWildcardNfaW instance out-of-band, atomically swap the active pointer
     // via InterlockedExchangePointer, and retire the old instance after readers
-    // drain (e.g., via EX_RUNDOWN_REF or KmSharedPtr: [https://github.com/adanil-code/KmSharedPtr](https://github.com/adanil-code/KmSharedPtr)).
+    // drain (e.g., via EX_RUNDOWN_REF or KmSharedPtr: https://github.com/adanil-code/KmSharedPtr).
     static constexpr WCHAR kTargetPath[] = L"\\Device\\HarddiskVolume1\\Temp\\cache.tmp";
     constexpr size_t targetLen = RTL_NUMBER_OF(kTargetPath) - 1;
 
