@@ -33,13 +33,12 @@ VOID FlushLogToFile();
 #define MAX_TEST_THREADS 64
 
 // Orders all prior loads and stores before any subsequent loads and stores.
+// Compiler-only barrier on x64 and ARM64 (both KM and UM) so hot benchmark loops
+// do not inject a hardware dmb ish fence on every iteration; inter-thread synchronization
+// is handled explicitly via Acquire/Release primitives.
 __forceinline void KmReadWriteBarrier() noexcept
 {
-#if defined(_M_ARM64) || defined(_M_ARM64EC)
-    __dmb(_ARM64_BARRIER_ISH);
-#else
     _ReadWriteBarrier();
-#endif
 }
 
 // Configuration structure allowing callers to selectively run modules
@@ -83,19 +82,19 @@ struct PCORE_THREAD_INFO
     KAFFINITY ThreadMask; // Isolated 1-bit mask representing a distinct logical processor on a P-core
 };
 
-inline ULONG GetPCoreLogicalThreads(_Out_writes_(ulMaxCores) PCORE_THREAD_INFO* pCoreThreads, 
+inline ULONG GetPCoreLogicalThreads(_Out_writes_(ulMaxCores) PCORE_THREAD_INFO* pCoreThreads,
                                     _In_                     ULONG              ulMaxCores)
 {
     ULONG ulCount = 0;
     ULONG length  = 0;
 
     NTSTATUS status = KeQueryLogicalProcessorRelationship(NULL, RelationProcessorCore, NULL, &length);
-    if (status != STATUS_BUFFER_TOO_SMALL && length == 0)
+    if ((status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL) || length == 0)
     {
         return 0;
     }
 
-    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer = 
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer =
         static_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ExAllocatePool2(POOL_FLAG_PAGED, length, TEST_POOL__TAG));
 
     if (!buffer)
@@ -195,9 +194,9 @@ inline size_t KStringLength(_In_z_ const wchar_t* __restrict s)
 // Initializes and starts a pool of worker threads synchronized on an event.
 // Automatically pins threads to logical P-core threads to eliminate preemption.
 // -------------------------------------------------------------------------------------
-VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr, 
-                  _In_     ULONG                ulCount, 
-                  _In_     PTEST_WORKER_FUNC    pFunc, 
+VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
+                  _In_     ULONG                ulCount,
+                  _In_     PTEST_WORKER_FUNC    pFunc,
                   _In_opt_ PVOID                pUserContext)
 {
     PAGED_CODE();
@@ -228,7 +227,7 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
 
     pMgr->ulThreadCount = ulCount;
     WriteNoFence(&pMgr->lStopFlag, 0);
-    
+
     KeInitializeEvent(&pMgr->StartEvent, NotificationEvent, FALSE);
 
     for (ULONG ulIndex = 0; ulIndex < ulCount; ++ulIndex)
@@ -238,7 +237,7 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
         pMgr->Contexts[ulIndex].plStopFlag   = &pMgr->lStopFlag;
         pMgr->Contexts[ulIndex].pUserContext = pUserContext;
 
-        if (ulCoreCount > 0 && ulIndex < ulCoreCount)
+        if (ulIndex < ulCoreCount)
         {
             pMgr->Contexts[ulIndex].bSetAffinity  = TRUE;
             pMgr->Contexts[ulIndex].AffinityGroup = pCoreThreads[ulIndex].Group;
@@ -252,21 +251,21 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
         }
 
         HANDLE   hThread;
-        NTSTATUS ntStatus = PsCreateSystemThread(&hThread, 
-                                                 0, 
-                                                 NULL, 
-                                                 NULL, 
-                                                 NULL, 
+        NTSTATUS ntStatus = PsCreateSystemThread(&hThread,
+                                                 0,
+                                                 NULL,
+                                                 NULL,
+                                                 NULL,
                                                  reinterpret_cast<PKSTART_ROUTINE>(pFunc),
                                                  &pMgr->Contexts[ulIndex]);
         if (NT_SUCCESS(ntStatus)) [[likely]]
         {
-            ntStatus = ObReferenceObjectByHandle(hThread, 
-                                                 0, 
-                                                 NULL, 
-                                                 KernelMode, 
-                                                 reinterpret_cast<PVOID*>(&pMgr->pThreads[ulIndex]), 
-                                                 NULL);                                                 
+            ntStatus = ObReferenceObjectByHandle(hThread,
+                                                 0,
+                                                 NULL,
+                                                 KernelMode,
+                                                 reinterpret_cast<PVOID*>(&pMgr->pThreads[ulIndex]),
+                                                 NULL);
             if (NT_SUCCESS(ntStatus)) [[likely]]
             {
                 KeSetPriorityThread(pMgr->pThreads[ulIndex], 15);
@@ -275,12 +274,13 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
             else
             {
                 pMgr->pThreads[ulIndex] = NULL;
+                pMgr->ulThreadCount     = ulIndex;
                 WriteRelease(&pMgr->lStopFlag, 1);
                 WriteRelease(&g_lAbortTests, 1);
 
                 KeSetEvent(&pMgr->StartEvent, IO_NO_INCREMENT, FALSE);
-                KeWaitForSingleObject(hThread, Executive, KernelMode, FALSE, NULL);
                 ZwClose(hThread);
+                break;
             }
         }
         else
@@ -288,14 +288,14 @@ VOID StartThreads(_Inout_  TEST_THREAD_MANAGER* pMgr,
             pMgr->pThreads[ulIndex] = NULL;
         }
     }
-    
+
     KeSetEvent(&pMgr->StartEvent, IO_NO_INCREMENT, FALSE);
 }
 
 // -------------------------------------------------------------------------------------
 // Signals threads to stop and waits for them to terminate safely.
 // -------------------------------------------------------------------------------------
-VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr, 
+VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
                         _In_    int                  nSleepSeconds)
 {
     PAGED_CODE();
@@ -310,9 +310,9 @@ VOID StopAndWaitThreads(_Inout_ TEST_THREAD_MANAGER* pMgr,
             {
                 break;
             }
-            
+
             LARGE_INTEGER liDelay;
-            liDelay.QuadPart = -100000LL; 
+            liDelay.QuadPart = -100000LL;
             KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
         }
     }
@@ -359,7 +359,7 @@ BOOLEAN RunSingleCorrectnessTest(_In_ const TChar* __restrict pszText,
 
     KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
     PatternContext                       ctx = { 100 };
-    
+
     if (!NT_SUCCESS(Nfa.AddPattern(pszPattern, KStringLength(pszPattern), static_cast<typename KmWildcardNfa<PatternContext, TChar>::WILD_CARD_SCOPE>(ucScope), ctx))) [[unlikely]]
     {
         LOG_ERR("[NFA_TEST] [!] %s - AddPattern Failed\n", pszTestName);
@@ -384,7 +384,7 @@ BOOLEAN RunSingleCorrectnessTest(_In_ const TChar* __restrict pszText,
         LOG_INFO("[NFA_TEST] [+] PASS: %s\n", pszTestName);
         return TRUE;
     }
-    
+
     LOG_ERR("[NFA_TEST] [!] FAIL: %s (Expected %d, Got MatchAll: %d, MatchFirst: %d)\n", pszTestName, bShouldMatch, bMatchedAll, bMatchedFirst);
     return FALSE;
 }
@@ -404,7 +404,7 @@ template <typename TChar> BOOLEAN RunMultiPatternCorrectnessTest(_In_ const TCha
     KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
     PatternContext                       ctx1 = { 1 };
     PatternContext                       ctx2 = { 2 };
-    
+
     if (!NT_SUCCESS(Nfa.AddPattern(pszPattern1, KStringLength(pszPattern1), KmWildcardNfa<PatternContext, TChar>::WILD_CARD_SCOPE::SCOPE_DEFAULT, ctx1))) [[unlikely]]
     {
         return FALSE;
@@ -414,25 +414,25 @@ template <typename TChar> BOOLEAN RunMultiPatternCorrectnessTest(_In_ const TCha
     {
         return FALSE;
     }
-    
+
     if (!NT_SUCCESS(Nfa.Compile())) [[unlikely]]
     {
         return FALSE;
     }
-    
+
     PatternContext results[2];
     ULONG          ulCount = 0;
     BOOLEAN        bAll    = Nfa.MatchAll(pszText, KStringLength(pszText), results, 2, &ulCount);
-    
+
     PatternContext firstRes = { 0 };
     BOOLEAN        bFirst   = Nfa.MatchFirst(pszText, KStringLength(pszText), &firstRes);
-    
+
     if (bAll && ulCount == 2 && bFirst && (firstRes.ulPatternId == 1 || firstRes.ulPatternId == 2)) [[likely]]
     {
         LOG_INFO("[NFA_TEST] [+] PASS: Multi-Pattern MatchAll & MatchFirst Overlap\n");
         return TRUE;
     }
-    
+
     LOG_ERR("[NFA_TEST] [!] FAIL: Multi-Pattern MatchAll & MatchFirst Overlap\n");
     return FALSE;
 }
@@ -550,7 +550,7 @@ BOOLEAN RunEmptyEngineTest(_In_ const TChar* __restrict pszText,
 
 // -------------------------------------------------------------------------------------
 // Test Function: RunClearLifecycleTest
-// Validates explicit engine state reset via Clear(), ensuring memory arenas 
+// Validates explicit engine state reset via Clear(), ensuring memory arenas
 // and vectors safely flush state outside of normal destruction.
 // -------------------------------------------------------------------------------------
 template <typename TChar>
@@ -567,7 +567,7 @@ BOOLEAN RunClearLifecycleTest(_In_ const TChar* __restrict pszPattern,
     {
         return FALSE;
     }
-    
+
     if (!NT_SUCCESS(Nfa.Compile())) [[unlikely]]
     {
         return FALSE;
@@ -681,7 +681,7 @@ VOID RunAllCorrectnessTests()
 
     LOG_INFO("\n[NFA_TEST] --- Correctness Tests [CHAR] ---\n");
     EXECUTE_CORRECTNESS_SUITE(CHAR, NARROW_STRING);
-    
+
     if (ulFailed == 0) [[likely]]
     {
         LOG_INFO("\n[NFA_TEST] [+] ALL TESTS SUCCEEDED (%u passed)\n", ulPassed);
@@ -743,7 +743,7 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
             bAborted = TRUE;
             break;
         }
-        
+
         YieldProcessor(); // Mitigates thread start skew during metrics capture
     }
 
@@ -755,13 +755,13 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
         if (pWorkerCtx->bUseMatchFirst)
         {
             PatternContext Result;
-            
+
             // Use ReadNoFence inside the hot loop to avoid atomic RMW pipeline stalls on ARM64/x64
             while (ReadNoFence(pCtx->plStopFlag) == 0 &&
                    ReadNoFence(&g_lAbortTests) == 0) [[likely]]
             {
                 BOOLEAN bRet = pWorkerCtx->pNfa->MatchFirst(pWorkerCtx->pText, pWorkerCtx->cchTextLen, &Result);
-                
+
                 // Assert throughput correctness - instantly abort thread and flag for shutdown on logic failure
                 if (bRet != pWorkerCtx->bExpectMatch) [[unlikely]]
                 {
@@ -769,7 +769,7 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
                     WriteRelease(&pWorkerCtx->lTestFailed, 1);
                     break;
                 }
-                
+
                 localOps++;
                 KmReadWriteBarrier();
             }
@@ -778,13 +778,13 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
         {
             PatternContext Results[10];
             ULONG          ulMatched;
-            
+
             // Use ReadNoFence inside the hot loop to avoid atomic RMW pipeline stalls on ARM64/x64
             while (ReadNoFence(pCtx->plStopFlag) == 0 &&
                    ReadNoFence(&g_lAbortTests) == 0) [[likely]]
             {
                 BOOLEAN bRet = pWorkerCtx->pNfa->MatchAll(pWorkerCtx->pText, pWorkerCtx->cchTextLen, Results, 10, &ulMatched);
-                
+
                 // Assert throughput correctness - instantly abort thread and flag for shutdown on logic failure
                 if (bRet != pWorkerCtx->bExpectMatch) [[unlikely]]
                 {
@@ -792,7 +792,7 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
                     WriteRelease(&pWorkerCtx->lTestFailed, 1);
                     break;
                 }
-                
+
                 localOps++;
                 KmReadWriteBarrier();
             }
@@ -802,11 +802,13 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
         LARGE_INTEGER liEnd = KeQueryPerformanceCounter(NULL);
 
         // 3. Calculate this thread's exact ops/sec, completely excluding OS teardown overhead
-        UINT64 localTicks = liEnd.QuadPart - liStart.QuadPart;
-        
-        if (localTicks > 0 && localOps > 0)
+        if (liEnd.QuadPart > liStart.QuadPart && localOps > 0 && pWorkerCtx->liFreq.QuadPart > 0)
         {
-            UINT64 localOpsPerSec = (localOps * pWorkerCtx->liFreq.QuadPart) / localTicks;
+            UINT64 localTicks     = static_cast<UINT64>(liEnd.QuadPart - liStart.QuadPart);
+            UINT64 freq           = static_cast<UINT64>(pWorkerCtx->liFreq.QuadPart);
+            UINT64 localOpsPerSec = (localOps / localTicks) * freq +
+                                    (((localOps % localTicks) * freq) + (localTicks / 2)) / localTicks;
+
             InterlockedExchangeAdd64(&pWorkerCtx->llTotalOpsPerSec, static_cast<LONG64>(localOpsPerSec));
         }
     }
@@ -815,127 +817,25 @@ VOID PerfWorkerT(_Inout_ TEST_WORKER_CONTEXT* __restrict pCtx)
 }
 
 // -------------------------------------------------------------------------------------
-// Test Function: RunPerformanceTier
-// Orchestrates performance execution, spins up worker threads, and calculates throughput
-// and latency metrics against pathological wildcard pattern workloads.
+// Shared Benchmark Runner: ExecutePerformanceBenchmark
+// Prints tier metadata, executes MatchAll and MatchFirst workers against a compiled NFA,
+// validates correctness, and reports throughput and latency metrics.
 // -------------------------------------------------------------------------------------
 template <typename TChar>
-BOOLEAN RunPerformanceTier(_In_ ULONG       ulPatternCount,
-                           _In_ ULONG       ulTextLenChars,
-                           _In_ BOOLEAN     bPathological,
-                           _In_ BOOLEAN     bExpectMatch,
-                           _In_ BOOLEAN     bCaseInsensitive,
-                           _In_ const char* pszTestName,
-                           _In_ const char* pszDescription,
-                           _In_ const char* pszPatternType,
-                           _In_ const char* pszCharType)
+BOOLEAN ExecutePerformanceBenchmark(_In_ KmWildcardNfa<PatternContext, TChar>& Nfa,
+                                    _In_ const TChar* __restrict               pText,
+                                    _In_ size_t                                cchTextLen,
+                                    _In_ ULONG                                 ulPatternCount,
+                                    _In_ BOOLEAN                               bExpectMatch,
+                                    _In_ const char*                           pszTestName,
+                                    _In_ const char*                           pszDescription,
+                                    _In_ const char*                           pszPatternType,
+                                    _In_ const char*                           pszCharType,
+                                    _In_ BOOLEAN                               bMatchFirstEarlyExits = FALSE)
 {
     PAGED_CODE();
-    
-    if (ReadAcquire(&g_lAbortTests) != 0) [[unlikely]]
-    {
-        return FALSE;
-    }
 
-    KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
-    BOOLEAN                              bTierSuccess = TRUE;
-    
-    const SIZE_T cbTextMap = static_cast<SIZE_T>(ulTextLenChars) * sizeof(TChar) + sizeof(TChar);
-    TChar*       pwszText  = static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, cbTextMap, TEST_POOL__TAG));
-    
-    if (!pwszText) [[unlikely]]
-    {
-        return FALSE;
-    }
-
-    for (ULONG i = 0; i < ulTextLenChars; i++)
-    {
-        if (bExpectMatch)
-        {
-            pwszText[i] = static_cast<TChar>('A' + (i % 26));
-        }
-        else
-        {
-            pwszText[i] = static_cast<TChar>('X'); // Forces negative matches
-        }
-    }
-    
-    // Inject a guaranteed match for Pattern 0 near the end of the text
-    if (bExpectMatch && ulTextLenChars >= 16)
-    {
-        if (bPathological)
-        {
-            pwszText[ulTextLenChars - 4] = static_cast<TChar>('A');
-            pwszText[ulTextLenChars - 3] = static_cast<TChar>('0');
-            pwszText[ulTextLenChars - 2] = static_cast<TChar>('B');
-        }
-        else
-        {
-            pwszText[ulTextLenChars - 9] = static_cast<TChar>('S');
-            pwszText[ulTextLenChars - 8] = static_cast<TChar>('Y');
-            pwszText[ulTextLenChars - 7] = static_cast<TChar>('S');
-            pwszText[ulTextLenChars - 6] = static_cast<TChar>('0');
-            pwszText[ulTextLenChars - 5] = static_cast<TChar>('0');
-            pwszText[ulTextLenChars - 4] = static_cast<TChar>('0');
-            pwszText[ulTextLenChars - 3] = static_cast<TChar>('0');
-            pwszText[ulTextLenChars - 2] = static_cast<TChar>('B');
-        }
-    }
-    
-    pwszText[ulTextLenChars] = static_cast<TChar>('\0');
-
-    TChar* pStrArray = 
-        static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, static_cast<SIZE_T>(ulPatternCount) * 64 * sizeof(TChar), TEST_POOL__TAG));
-
-    if (!pStrArray) [[unlikely]]
-    {
-        ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
-        return FALSE;
-    }
-
-    for (ULONG i = 0; i < ulPatternCount; i++)
-    {
-        if (bPathological)
-        {
-            if constexpr (sizeof(TChar) == 1)
-            {
-                sprintf_s(reinterpret_cast<char*>(&pStrArray[i * 64]), 64, "*A%dB*", static_cast<int>(i));
-            }
-            else
-            {
-                swprintf_s(reinterpret_cast<wchar_t*>(&pStrArray[i * 64]), 64, L"*A%dB*", static_cast<int>(i));
-            }
-        }
-        else
-        {
-            if constexpr (sizeof(TChar) == 1)
-            {
-                sprintf_s(reinterpret_cast<char*>(&pStrArray[i * 64]), 64, "SYS%04d*B*", static_cast<int>(i));
-            }
-            else
-            {
-                swprintf_s(reinterpret_cast<wchar_t*>(&pStrArray[i * 64]), 64, L"SYS%04d*B*", static_cast<int>(i));
-            }
-        }
-        
-        PatternContext ctx = { i };
-        
-        if (!NT_SUCCESS(Nfa.AddPattern(&pStrArray[i * 64], KStringLength(&pStrArray[i * 64]), KmWildcardNfa<PatternContext, TChar>::WILD_CARD_SCOPE::SCOPE_DEFAULT, ctx))) [[unlikely]]
-        {
-            ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
-            ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
-            return FALSE;
-        }
-    }
-
-    if (!NT_SUCCESS(Nfa.Compile())) [[unlikely]]
-    {
-        ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
-        ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
-        return FALSE;
-    }
-
-    LOG_INFO("\n[NFA_TEST] --- Perf Test [%s]: %s [%u Patterns | Text: %u Chars] ---\n", pszCharType, pszTestName, ulPatternCount, ulTextLenChars);
+    LOG_INFO("\n[NFA_TEST] --- Perf Test [%s]: %s [%u Patterns | Text: %u Chars] ---\n", pszCharType, pszTestName, ulPatternCount, static_cast<ULONG>(cchTextLen));
     LOG_INFO("[NFA_TEST]      %s\n", pszDescription);
     LOG_INFO("[NFA_TEST]      Pattern Type: %s\n", pszPatternType);
     LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
@@ -954,78 +854,188 @@ BOOLEAN RunPerformanceTier(_In_ ULONG       ulPatternCount,
 
         PerfWorkerCtx<TChar> Ctx = { 0 };
         Ctx.pNfa                 = &Nfa;
-        Ctx.pText                = pwszText;
-        Ctx.cchTextLen           = ulTextLenChars;
+        Ctx.pText                = pText;
+        Ctx.cchTextLen           = cchTextLen;
         Ctx.liFreq               = liFreq;
         Ctx.llTotalOpsPerSec     = 0;
         Ctx.bUseMatchFirst       = bMatchFirst;
         Ctx.bExpectMatch         = bExpectMatch;
         Ctx.lTestFailed          = 0;
 
-        TEST_THREAD_MANAGER* pMgr = 
+        TEST_THREAD_MANAGER* pMgr =
             static_cast<TEST_THREAD_MANAGER*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(TEST_THREAD_MANAGER), TEST_POOL__TAG));
-        
+
         if (pMgr) [[likely]]
         {
             StartThreads(pMgr, 1, PerfWorkerT<TChar>, &Ctx);
-                         
+
             LARGE_INTEGER liDelay;
-            liDelay.QuadPart = -2000000LL; 
+            liDelay.QuadPart = -2000000LL;
             KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
 
             WriteRelease(&Ctx.lStartFlag, 1);
-            
+
             // Wait for threads to clean up
             StopAndWaitThreads(pMgr, 2);
-            
+
             if (ReadAcquire(&Ctx.lTestFailed) != 0) [[unlikely]]
             {
                 LOG_ERR("[NFA_TEST]      %-18s | [!] FAILED: Unexpected Result (Expected %d, Actual %ld)\n", label, bExpectMatch, ReadNoFence(&Ctx.lActualResult));
-                
                 WriteRelease(&g_lAbortTests, 1);
-                
+
                 ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
                 return FALSE;
             }
             else
             {
                 UINT64 opsPerSec = static_cast<UINT64>(ReadAcquire64(&Ctx.llTotalOpsPerSec));
-                
+
                 UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
                 UINT64 usWhole = totalPs / 1000000;
                 UINT64 usFrac  = (totalPs % 1000000) / 100;
 
-                // Test design ensures the entire string is scanned before the match succeeds or fails.
-                UINT64 bytesPerOp  = static_cast<UINT64>(Ctx.cchTextLen) * sizeof(TChar);
-                UINT64 bytesPerSec = opsPerSec * bytesPerOp;
-                UINT64 mbWhole     = bytesPerSec / (1024ULL * 1024ULL);
-
-                if (mbWhole < 1)
+                // Only calculate and display MB/s if the engine was forced to process the entire buffer.
+                // When bMatchFirstEarlyExits is TRUE (e.g., prose test where *allocation* matches within the
+                // first ~120 characters of a 100KB buffer), MatchFirst legitimately exits early, so
+                // calculating MB/s using the full buffer length would artificially inflate throughput.
+                if (!bMatchFirstEarlyExits || !bMatchFirst || !bExpectMatch)
                 {
-                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
-                    LOG_INFO("[NFA_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
+                    // Test design ensures the entire string is scanned before the match succeeds or fails.
+                    UINT64 bytesPerOp  = static_cast<UINT64>(Ctx.cchTextLen) * sizeof(TChar);
+                    UINT64 bytesPerSec = opsPerSec * bytesPerOp;
+                    UINT64 mbWhole     = bytesPerSec / (1024ULL * 1024ULL);
+
+                    if (mbWhole < 1)
+                    {
+                        UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
+                        LOG_INFO("[NFA_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
+                    }
+                    else
+                    {
+                        LOG_INFO("[NFA_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                    }
                 }
                 else
                 {
-                    LOG_INFO("[NFA_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
+                    LOG_INFO("[NFA_TEST]      %-18s | %15s | %15llu | %9llu.%04llu us\n", label, "N/A (EarlyExit)", opsPerSec, usWhole, usFrac);
                 }
 
                 ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
                 return TRUE;
             }
         }
-        
+
         return FALSE;
     };
 
     if (RunMode(FALSE, "MatchAll")) [[likely]]
     {
-        RunMode(TRUE, "MatchFirst");
+        return RunMode(TRUE, "MatchFirst");
     }
-    else
+
+    return FALSE;
+}
+
+// -------------------------------------------------------------------------------------
+// Test Function: RunPerformanceTier
+// Orchestrates performance execution, spins up worker threads, and calculates throughput
+// and latency metrics against pathological wildcard pattern workloads.
+// -------------------------------------------------------------------------------------
+template <typename TChar>
+BOOLEAN RunPerformanceTier(_In_ ULONG       ulPatternCount,
+                           _In_ ULONG       ulTextLenChars,
+                           _In_ BOOLEAN     bExpectMatch,
+                           _In_ BOOLEAN     bCaseInsensitive,
+                           _In_ const char* pszTestName,
+                           _In_ const char* pszDescription,
+                           _In_ const char* pszPatternType,
+                           _In_ const char* pszCharType)
+{
+    PAGED_CODE();
+
+    if (ReadAcquire(&g_lAbortTests) != 0) [[unlikely]]
     {
-        bTierSuccess = FALSE;
+        return FALSE;
     }
+
+    KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
+
+    const SIZE_T cbTextMap = static_cast<SIZE_T>(ulTextLenChars) * sizeof(TChar) + sizeof(TChar);
+    TChar*       pwszText  = static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, cbTextMap, TEST_POOL__TAG));
+
+    if (!pwszText) [[unlikely]]
+    {
+        return FALSE;
+    }
+
+    for (ULONG i = 0; i < ulTextLenChars; i++)
+    {
+        if (bExpectMatch)
+        {
+            pwszText[i] = static_cast<TChar>('A' + (i % 26));
+        }
+        else
+        {
+            pwszText[i] = static_cast<TChar>('X'); // Forces negative matches
+        }
+    }
+
+    // Inject a guaranteed match for Pattern 0 near the end of the text
+    if (bExpectMatch && ulTextLenChars >= 16)
+    {
+        pwszText[ulTextLenChars - 4] = static_cast<TChar>('A');
+        pwszText[ulTextLenChars - 3] = static_cast<TChar>('0');
+        pwszText[ulTextLenChars - 2] = static_cast<TChar>('B');
+    }
+
+    pwszText[ulTextLenChars] = static_cast<TChar>('\0');
+
+    TChar* pStrArray =
+        static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, static_cast<SIZE_T>(ulPatternCount) * 64 * sizeof(TChar), TEST_POOL__TAG));
+
+    if (!pStrArray) [[unlikely]]
+    {
+        ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
+        return FALSE;
+    }
+
+    for (ULONG i = 0; i < ulPatternCount; i++)
+    {
+        if constexpr (sizeof(TChar) == 1)
+        {
+            sprintf_s(reinterpret_cast<char*>(&pStrArray[i * 64]), 64, "*A%dB*", static_cast<int>(i));
+        }
+        else
+        {
+            swprintf_s(reinterpret_cast<wchar_t*>(&pStrArray[i * 64]), 64, L"*A%dB*", static_cast<int>(i));
+        }
+
+        PatternContext ctx = { i };
+
+        if (!NT_SUCCESS(Nfa.AddPattern(&pStrArray[i * 64], KStringLength(&pStrArray[i * 64]), KmWildcardNfa<PatternContext, TChar>::WILD_CARD_SCOPE::SCOPE_DEFAULT, ctx))) [[unlikely]]
+        {
+            ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
+            ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
+            return FALSE;
+        }
+    }
+
+    if (!NT_SUCCESS(Nfa.Compile())) [[unlikely]]
+    {
+        ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
+        ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
+        return FALSE;
+    }
+
+    BOOLEAN bTierSuccess = ExecutePerformanceBenchmark<TChar>(Nfa,
+                                                              pwszText,
+                                                              ulTextLenChars,
+                                                              ulPatternCount,
+                                                              bExpectMatch,
+                                                              pszTestName,
+                                                              pszDescription,
+                                                              pszPatternType,
+                                                              pszCharType);
 
     ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
     ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
@@ -1055,11 +1065,10 @@ BOOLEAN RunRealisticPathPerformanceTier(_In_ ULONG       ulPatternCount,
     }
 
     KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
-    BOOLEAN                              bTierSuccess = TRUE;
 
-    TChar* pStrArray = 
+    TChar* pStrArray =
         static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, static_cast<SIZE_T>(ulPatternCount) * 128 * sizeof(TChar), TEST_POOL__TAG));
-    
+
     if (!pStrArray) [[unlikely]]
     {
         return FALSE;
@@ -1114,7 +1123,7 @@ BOOLEAN RunRealisticPathPerformanceTier(_In_ ULONG       ulPatternCount,
         }
 
         PatternContext ctx = { i };
-        
+
         if (!NT_SUCCESS(Nfa.AddPattern(pCurPat, KStringLength(pCurPat), KmWildcardNfa<PatternContext, TChar>::WILD_CARD_SCOPE::SCOPE_DEFAULT, ctx))) [[unlikely]]
         {
             ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
@@ -1133,109 +1142,28 @@ BOOLEAN RunRealisticPathPerformanceTier(_In_ ULONG       ulPatternCount,
 
     if constexpr (sizeof(TChar) == 1)
     {
-        pwszTargetPath = bExpectMatch 
+        pwszTargetPath = bExpectMatch
             ? reinterpret_cast<const TChar*>("\\Device\\HarddiskVolume2\\Program Files\\App0\\bin\\crypt.exe")
             : reinterpret_cast<const TChar*>("\\Device\\HarddiskVolume2\\Program Files\\SafeApp\\bin\\clean.exe");
     }
     else
     {
-        pwszTargetPath = bExpectMatch 
+        pwszTargetPath = bExpectMatch
             ? reinterpret_cast<const TChar*>(L"\\Device\\HarddiskVolume2\\Program Files\\App0\\bin\\crypt.exe")
             : reinterpret_cast<const TChar*>(L"\\Device\\HarddiskVolume2\\Program Files\\SafeApp\\bin\\clean.exe");
     }
 
     size_t cchPathLen = KStringLength(pwszTargetPath);
 
-    LOG_INFO("\n[NFA_TEST] --- Perf Test [%s]: %s [%u Patterns | Text: %u Chars] ---\n", pszCharType, pszTestName, ulPatternCount, static_cast<ULONG>(cchPathLen));
-    LOG_INFO("[NFA_TEST]      %s\n", pszDescription);
-    LOG_INFO("[NFA_TEST]      Pattern Type: %s\n", pszPatternType);
-    LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
-    LOG_INFO("[NFA_TEST]      %-18s | %-15s | %-15s | %-15s\n", "Engine Mode", "Throughput", "Ops/sec", "Latency/Op");
-    LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
-
-    LARGE_INTEGER liFreq;
-    KeQueryPerformanceCounter(&liFreq);
-
-    auto RunMode = [&](BOOLEAN bMatchFirst, const char* label) -> BOOLEAN
-    {
-        if (ReadAcquire(&g_lAbortTests) != 0) [[unlikely]]
-        {
-            return FALSE;
-        }
-
-        PerfWorkerCtx<TChar> Ctx = { 0 };
-        Ctx.pNfa                 = &Nfa;
-        Ctx.pText                = pwszTargetPath;
-        Ctx.cchTextLen           = cchPathLen;
-        Ctx.liFreq               = liFreq;
-        Ctx.llTotalOpsPerSec     = 0;
-        Ctx.bUseMatchFirst       = bMatchFirst;
-        Ctx.bExpectMatch         = bExpectMatch;
-        Ctx.lTestFailed          = 0;
-
-        TEST_THREAD_MANAGER* pMgr = 
-            static_cast<TEST_THREAD_MANAGER*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(TEST_THREAD_MANAGER), TEST_POOL__TAG));
-        
-        if (pMgr) [[likely]]
-        {
-            StartThreads(pMgr, 1, PerfWorkerT<TChar>, &Ctx);
-                         
-            LARGE_INTEGER liDelay;
-            liDelay.QuadPart = -2000000LL; 
-            KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
-
-            WriteRelease(&Ctx.lStartFlag, 1);
-            
-            // Wait for threads to clean up
-            StopAndWaitThreads(pMgr, 2);
-            
-            if (ReadAcquire(&Ctx.lTestFailed) != 0) [[unlikely]]
-            {
-                LOG_ERR("[NFA_TEST]      %-18s | [!] FAILED: Unexpected Result (Expected %d, Actual %ld)\n", label, bExpectMatch, ReadNoFence(&Ctx.lActualResult));
-                WriteRelease(&g_lAbortTests, 1);
-                
-                ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
-                return FALSE;
-            }
-            else
-            {
-                UINT64 opsPerSec = static_cast<UINT64>(ReadAcquire64(&Ctx.llTotalOpsPerSec));
-                
-                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
-                UINT64 usWhole = totalPs / 1000000;
-                UINT64 usFrac  = (totalPs % 1000000) / 100;
-
-                // Test design ensures the entire string is scanned before the match succeeds or fails.
-                UINT64 bytesPerOp  = static_cast<UINT64>(Ctx.cchTextLen) * sizeof(TChar);
-                UINT64 bytesPerSec = opsPerSec * bytesPerOp;
-                UINT64 mbWhole     = bytesPerSec / (1024ULL * 1024ULL);
-
-                if (mbWhole < 1)
-                {
-                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
-                    LOG_INFO("[NFA_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
-                }
-                else
-                {
-                    LOG_INFO("[NFA_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
-                }
-
-                ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
-                return TRUE;
-            }
-        }
-        
-        return FALSE;
-    };
-
-    if (RunMode(FALSE, "MatchAll")) [[likely]]
-    {
-        RunMode(TRUE, "MatchFirst");
-    }
-    else
-    {
-        bTierSuccess = FALSE;
-    }
+    BOOLEAN bTierSuccess = ExecutePerformanceBenchmark<TChar>(Nfa,
+                                                              pwszTargetPath,
+                                                              cchPathLen,
+                                                              ulPatternCount,
+                                                              bExpectMatch,
+                                                              pszTestName,
+                                                              pszDescription,
+                                                              pszPatternType,
+                                                              pszCharType);
 
     ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
 
@@ -1264,8 +1192,7 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
     }
 
     KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
-    BOOLEAN                              bTierSuccess = TRUE;
-    
+
     // Meaningful prose context to exercise realistic string density dynamically selected by char size
     const TChar* pwszMeaningfulText;
     if constexpr (sizeof(TChar) == 1)
@@ -1280,7 +1207,7 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
     size_t cchSnippetLen = KStringLength(pwszMeaningfulText);
 
     TChar* pwszText = static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, (static_cast<SIZE_T>(ulTextLenChars) + 1) * sizeof(TChar), TEST_POOL__TAG));
-    
+
     if (!pwszText) [[unlikely]]
     {
         return FALSE;
@@ -1290,11 +1217,11 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
     {
         pwszText[i] = pwszMeaningfulText[i % cchSnippetLen];
     }
-    
+
     pwszText[ulTextLenChars] = static_cast<TChar>('\0');
 
     TChar* pStrArray = static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, static_cast<SIZE_T>(ulPatternCount) * 128 * sizeof(TChar), TEST_POOL__TAG));
-    
+
     if (!pStrArray) [[unlikely]]
     {
         ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
@@ -1303,7 +1230,19 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
 
     for (ULONG i = 0; i < ulPatternCount; i++)
     {
-        if (bExpectMatch)
+        if (bExpectMatch && i == ulPatternCount - 1)
+        {
+            // Ensure at least one known good pattern matches if we expect a match
+            if constexpr (sizeof(TChar) == 1)
+            {
+                sprintf_s(reinterpret_cast<char*>(&pStrArray[i * 128]), 128, "*allocation*");
+            }
+            else
+            {
+                swprintf_s(reinterpret_cast<wchar_t*>(&pStrArray[i * 128]), 128, L"*allocation*");
+            }
+        }
+        else if (bExpectMatch)
         {
             if constexpr (sizeof(TChar) == 1)
             {
@@ -1325,22 +1264,9 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
                 swprintf_s(reinterpret_cast<wchar_t*>(&pStrArray[i * 128]), 128, L"*random*notfound*%u*", static_cast<unsigned int>(i));
             }
         }
-        
-        // Ensure at least one known good pattern matches if we expect a match
-        if (bExpectMatch && i == ulPatternCount - 1)
-        {
-            if constexpr (sizeof(TChar) == 1)
-            {
-                sprintf_s(reinterpret_cast<char*>(&pStrArray[i * 128]), 128, "*allocation*");
-            }
-            else
-            {
-                swprintf_s(reinterpret_cast<wchar_t*>(&pStrArray[i * 128]), 128, L"*allocation*");
-            }
-        }
 
         PatternContext ctx = { i };
-        
+
         if (!NT_SUCCESS(Nfa.AddPattern(&pStrArray[i * 128], KStringLength(&pStrArray[i * 128]), KmWildcardNfa<PatternContext, TChar>::WILD_CARD_SCOPE::SCOPE_DEFAULT, ctx))) [[unlikely]]
         {
             ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
@@ -1356,106 +1282,16 @@ BOOLEAN RunMeaningfulTextPerformanceTier(_In_ ULONG       ulPatternCount,
         return FALSE;
     }
 
-    LOG_INFO("\n[NFA_TEST] --- Perf Test [%s]: %s [%u Patterns | Text: %u Chars] ---\n", pszCharType, pszTestName, ulPatternCount, ulTextLenChars);
-    LOG_INFO("[NFA_TEST]      %s\n", pszDescription);
-    LOG_INFO("[NFA_TEST]      Pattern Type: %s\n", pszPatternType);
-    LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
-    LOG_INFO("[NFA_TEST]      %-18s | %-15s | %-15s | %-15s\n", "Engine Mode", "Throughput", "Ops/sec", "Latency/Op");
-    LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
-
-    LARGE_INTEGER liFreq;
-    KeQueryPerformanceCounter(&liFreq);
-
-    auto RunMode = [&](BOOLEAN bMatchFirst, const char* label) -> BOOLEAN
-    {
-        if (ReadAcquire(&g_lAbortTests) != 0) [[unlikely]]
-        {
-            return FALSE;
-        }
-
-        PerfWorkerCtx<TChar> Ctx = { 0 };
-        Ctx.pNfa                 = &Nfa;
-        Ctx.pText                = pwszText;
-        Ctx.cchTextLen           = ulTextLenChars;
-        Ctx.liFreq               = liFreq;
-        Ctx.llTotalOpsPerSec     = 0;
-        Ctx.bUseMatchFirst       = bMatchFirst;
-        Ctx.bExpectMatch         = bExpectMatch;
-        Ctx.lTestFailed          = 0;
-
-        TEST_THREAD_MANAGER* pMgr = 
-            static_cast<TEST_THREAD_MANAGER*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(TEST_THREAD_MANAGER), TEST_POOL__TAG));
-        
-        if (pMgr) [[likely]]
-        {
-            StartThreads(pMgr, 1, PerfWorkerT<TChar>, &Ctx);
-                         
-            LARGE_INTEGER liDelay;
-            liDelay.QuadPart = -2000000LL; 
-            KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
-
-            WriteRelease(&Ctx.lStartFlag, 1);
-            
-            // Wait for threads to clean up
-            StopAndWaitThreads(pMgr, 2);
-            
-            if (ReadAcquire(&Ctx.lTestFailed) != 0) [[unlikely]]
-            {
-                LOG_ERR("[NFA_TEST]      %-18s | [!] FAILED: Unexpected Result (Expected %d, Actual %ld)\n", label, bExpectMatch, ReadNoFence(&Ctx.lActualResult));
-                WriteRelease(&g_lAbortTests, 1);
-                
-                ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
-                return FALSE;
-            }
-            else
-            {
-                UINT64 opsPerSec = static_cast<UINT64>(ReadAcquire64(&Ctx.llTotalOpsPerSec));
-                
-                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
-                UINT64 usWhole = totalPs / 1000000;
-                UINT64 usFrac  = (totalPs % 1000000) / 100;
-
-                // Only calculate and display MB/s if the engine was forced to process the entire buffer.
-                // In this specific prose test, *allocation* matches within the first ~120 characters 
-                // of the 100KB buffer, meaning MatchFirst legitimately exits early. 
-                // Calculating MB/s using the full 100KB length would artificially inflate throughput to ~700 GB/s.
-                if (!bMatchFirst || !bExpectMatch)
-                {
-                    UINT64 bytesPerOp  = static_cast<UINT64>(Ctx.cchTextLen) * sizeof(TChar);
-                    UINT64 bytesPerSec = opsPerSec * bytesPerOp;
-                    UINT64 mbWhole     = bytesPerSec / (1024ULL * 1024ULL);
-
-                    if (mbWhole < 1)
-                    {
-                        UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
-                        LOG_INFO("[NFA_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
-                    }
-                    else
-                    {
-                        LOG_INFO("[NFA_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
-                    }
-                }
-                else
-                {
-                    LOG_INFO("[NFA_TEST]      %-18s | %15s | %15llu | %9llu.%04llu us\n", label, "N/A (EarlyExit)", opsPerSec, usWhole, usFrac);
-                }
-
-                ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
-                return TRUE;
-            }
-        }
-        
-        return FALSE;
-    };
-
-    if (RunMode(FALSE, "MatchAll")) [[likely]]
-    {
-        RunMode(TRUE, "MatchFirst");
-    }
-    else
-    {
-        bTierSuccess = FALSE;
-    }
+    BOOLEAN bTierSuccess = ExecutePerformanceBenchmark<TChar>(Nfa,
+                                                              pwszText,
+                                                              ulTextLenChars,
+                                                              ulPatternCount,
+                                                              bExpectMatch,
+                                                              pszTestName,
+                                                              pszDescription,
+                                                              pszPatternType,
+                                                              pszCharType,
+                                                              TRUE);
 
     ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
     ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
@@ -1485,7 +1321,6 @@ BOOLEAN RunExactStringPerformanceTier(_In_ ULONG       ulPatternCount,
     }
 
     KmWildcardNfa<PatternContext, TChar> Nfa(bCaseInsensitive);
-    BOOLEAN                              bTierSuccess = TRUE;
 
     const SIZE_T cbTextMap = static_cast<SIZE_T>(ulTextLenChars) * sizeof(TChar) + sizeof(TChar);
     TChar*       pwszText  = static_cast<TChar*>(ExAllocatePool2(POOL_FLAG_PAGED, cbTextMap, TEST_POOL__TAG));
@@ -1542,96 +1377,15 @@ BOOLEAN RunExactStringPerformanceTier(_In_ ULONG       ulPatternCount,
         return FALSE;
     }
 
-    LOG_INFO("\n[NFA_TEST] --- Perf Test [%s]: %s [%u Patterns | Text: %u Chars] ---\n", pszCharType, pszTestName, ulPatternCount, ulTextLenChars);
-    LOG_INFO("[NFA_TEST]      %s\n", pszDescription);
-    LOG_INFO("[NFA_TEST]      Pattern Type: %s\n", pszPatternType);
-    LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
-    LOG_INFO("[NFA_TEST]      %-18s | %-15s | %-15s | %-15s\n", "Engine Mode", "Throughput", "Ops/sec", "Latency/Op");
-    LOG_INFO("[NFA_TEST]      ------------------------------------------------------------------------------------\n");
-
-    LARGE_INTEGER liFreq;
-    KeQueryPerformanceCounter(&liFreq);
-
-    auto RunMode = [&](BOOLEAN bMatchFirst, const char* label) -> BOOLEAN
-    {
-        if (ReadAcquire(&g_lAbortTests) != 0) [[unlikely]]
-        {
-            return FALSE;
-        }
-
-        PerfWorkerCtx<TChar> Ctx = { 0 };
-        Ctx.pNfa                 = &Nfa;
-        Ctx.pText                = pwszText;
-        Ctx.cchTextLen           = ulTextLenChars;
-        Ctx.liFreq               = liFreq;
-        Ctx.llTotalOpsPerSec     = 0;
-        Ctx.bUseMatchFirst       = bMatchFirst;
-        Ctx.bExpectMatch         = bExpectMatch;
-        Ctx.lTestFailed          = 0;
-
-        TEST_THREAD_MANAGER* pMgr = 
-            static_cast<TEST_THREAD_MANAGER*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(TEST_THREAD_MANAGER), TEST_POOL__TAG));
-
-        if (pMgr) [[likely]]
-        {
-            StartThreads(pMgr, 1, PerfWorkerT<TChar>, &Ctx);
-
-            LARGE_INTEGER liDelay;
-            liDelay.QuadPart = -2000000LL;
-            KeDelayExecutionThread(KernelMode, FALSE, &liDelay);
-
-            WriteRelease(&Ctx.lStartFlag, 1);
-            
-            // Wait for threads to clean up
-            StopAndWaitThreads(pMgr, 2);            
-
-            if (ReadAcquire(&Ctx.lTestFailed) != 0) [[unlikely]]
-            {
-                LOG_ERR("[NFA_TEST]      %-18s | [!] FAILED: Unexpected Result (Expected %d, Actual %ld)\n", label, bExpectMatch, ReadNoFence(&Ctx.lActualResult));
-                WriteRelease(&g_lAbortTests, 1);
-
-                ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
-                return FALSE;
-            }
-            else
-            {
-                UINT64 opsPerSec = static_cast<UINT64>(ReadAcquire64(&Ctx.llTotalOpsPerSec));
-                
-                UINT64 totalPs = opsPerSec > 0 ? ((1000000000000ULL * (pMgr->ulThreadCount > 0 ? pMgr->ulThreadCount : 1)) / opsPerSec) : 0;
-                UINT64 usWhole = totalPs / 1000000;
-                UINT64 usFrac  = (totalPs % 1000000) / 100;
-
-                // Test design ensures the entire string is scanned before the match succeeds or fails.
-                UINT64 bytesPerOp  = static_cast<UINT64>(Ctx.cchTextLen) * sizeof(TChar);
-                UINT64 bytesPerSec = opsPerSec * bytesPerOp;
-                UINT64 mbWhole     = bytesPerSec / (1024ULL * 1024ULL);
-
-                if (mbWhole < 1)
-                {
-                    UINT64 mbFrac = ((bytesPerSec % (1024ULL * 1024ULL)) * 100ULL) / (1024ULL * 1024ULL);
-                    LOG_INFO("[NFA_TEST]      %-18s | %7llu.%02llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, mbFrac, opsPerSec, usWhole, usFrac);
-                }
-                else
-                {
-                    LOG_INFO("[NFA_TEST]      %-18s | %10llu MB/s | %15llu | %9llu.%04llu us\n", label, mbWhole, opsPerSec, usWhole, usFrac);
-                }
-
-                ExFreePoolWithTag(pMgr, TEST_POOL__TAG);
-                return TRUE;
-            }
-        }
-
-        return FALSE;
-    };
-
-    if (RunMode(FALSE, "MatchAll")) [[likely]]
-    {
-        RunMode(TRUE, "MatchFirst");
-    }
-    else
-    {
-        bTierSuccess = FALSE;
-    }
+    BOOLEAN bTierSuccess = ExecutePerformanceBenchmark<TChar>(Nfa,
+                                                              pwszText,
+                                                              ulTextLenChars,
+                                                              ulPatternCount,
+                                                              bExpectMatch,
+                                                              pszTestName,
+                                                              pszDescription,
+                                                              pszPatternType,
+                                                              pszCharType);
 
     ExFreePoolWithTag(pStrArray, TEST_POOL__TAG);
     ExFreePoolWithTag(pwszText, TEST_POOL__TAG);
@@ -1665,13 +1419,13 @@ VOID ExecutePerformanceTiers(_Inout_ ULONG&      ulPassed,
         }
     };
 
-    CheckTest(RunPerformanceTier<TChar>(10, 512, TRUE, TRUE, TRUE, "Small Pathological", "Evaluates throughput against a saturated set of short pathological wildcard rules.", "Pathological (*A%dB*)", pszCharType));
+    CheckTest(RunPerformanceTier<TChar>(10, 512, TRUE, TRUE, "Small Pathological", "Evaluates throughput against a saturated set of short pathological wildcard rules.", "Pathological (*A%dB*)", pszCharType));
 
-    CheckTest(RunPerformanceTier<TChar>(100, 10240, TRUE, TRUE, TRUE, "Medium Pathological", "Evaluates throughput against a saturated set of medium pathological wildcard rules.", "Pathological (*A%dB*)", pszCharType));
+    CheckTest(RunPerformanceTier<TChar>(100, 10240, TRUE, TRUE, "Medium Pathological", "Evaluates throughput against a saturated set of medium pathological wildcard rules.", "Pathological (*A%dB*)", pszCharType));
 
-    CheckTest(RunPerformanceTier<TChar>(1000, 102400, TRUE, TRUE, TRUE, "Large Pathological", "Evaluates throughput against a saturated set of long pathological wildcard rules.", "Pathological (*A%dB*)", pszCharType));
+    CheckTest(RunPerformanceTier<TChar>(1000, 102400, TRUE, TRUE, "Large Pathological", "Evaluates throughput against a saturated set of long pathological wildcard rules.", "Pathological (*A%dB*)", pszCharType));
 
-    CheckTest(RunPerformanceTier<TChar>(100, 10240, TRUE, FALSE, TRUE, "Negative Mismatch", "Tests engine behavior when no patterns match the target string.", "Pathological (*A%dB*)", pszCharType));
+    CheckTest(RunPerformanceTier<TChar>(100, 10240, FALSE, TRUE, "Negative Mismatch", "Tests engine behavior when no patterns match the target string.", "Pathological (*A%dB*)", pszCharType));
 
     CheckTest(RunRealisticPathPerformanceTier<TChar>(10, TRUE, TRUE, "Realistic Paths", "Benchmarks against a small set of typical kernel file paths.", "File Paths (\\Device\\...)", pszCharType));
 
@@ -1700,7 +1454,7 @@ VOID ExecutePerformanceTiers(_Inout_ ULONG&      ulPassed,
     CheckTest(RunExactStringPerformanceTier<TChar>(1000, 128, TRUE, TRUE, "Exact String", "Simulates 128-char text with exact string matching.", "Exact Literal (No Wildcards)", pszCharType));
 
     CheckTest(RunExactStringPerformanceTier<TChar>(10000, 128, TRUE, TRUE, "Exact String", "Simulates 128-char text with exact string matching.", "Exact Literal (No Wildcards)", pszCharType));
-    
+
     CheckTest(RunExactStringPerformanceTier<TChar>(100, 128, FALSE, TRUE, "Exact String Negative", "Tests mismatch behavior on 128-char exact string context.", "Exact Literal (No Wildcards)", pszCharType));
 
     CheckTest(RunExactStringPerformanceTier<TChar>(10, 256, TRUE, TRUE, "Exact String", "Simulates 256-char text with exact string matching.", "Exact Literal (No Wildcards)", pszCharType));
@@ -1708,16 +1462,16 @@ VOID ExecutePerformanceTiers(_Inout_ ULONG&      ulPassed,
     CheckTest(RunExactStringPerformanceTier<TChar>(100, 256, TRUE, TRUE, "Exact String", "Simulates 256-char text with exact string matching.", "Exact Literal (No Wildcards)", pszCharType));
 
     CheckTest(RunExactStringPerformanceTier<TChar>(1000, 256, TRUE, TRUE, "Exact String", "Simulates 256-char text with exact string matching.", "Exact Literal (No Wildcards)", pszCharType));
-    
+
     CheckTest(RunExactStringPerformanceTier<TChar>(10000, 256, TRUE, TRUE, "Exact String", "Simulates 256-char text with exact string matching.", "Exact Literal (No Wildcards)", pszCharType));
-    
+
     CheckTest(RunExactStringPerformanceTier<TChar>(100, 256, FALSE, TRUE, "Exact String Negative", "Tests mismatch behavior on 256-char exact string context.", "Exact Literal (No Wildcards)", pszCharType));
 }
 
 // -------------------------------------------------------------------------------------
 // Orchestrates all performance test tiers for both char strings.
 // -------------------------------------------------------------------------------------
-VOID 
+VOID
 RunAllPerformanceTests()
 {
     PAGED_CODE();
@@ -1755,8 +1509,8 @@ VOID RunTests(_In_opt_ PVOID pContext)
 
     TEST_SUITE_CONFIG* pConfig = static_cast<TEST_SUITE_CONFIG*>(pContext);
 
-    KeSetPriorityThread(KeGetCurrentThread(), 2); 
-    
+    KeSetPriorityThread(KeGetCurrentThread(), 2);
+
     LOG_INFO("\n[NFA_TEST] =========================================================================================\n");
     LOG_INFO("[NFA_TEST]          KMWILDCARDNFA UNIFIED TEST SUITE\n");
     LOG_INFO("[NFA_TEST] =========================================================================================\n");
@@ -1773,7 +1527,7 @@ VOID RunTests(_In_opt_ PVOID pContext)
     }
 
     LOG_INFO("\n[NFA_TEST] --- All Tests Finished ---\n\n");
-    
+
     FlushLogToFile();
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
